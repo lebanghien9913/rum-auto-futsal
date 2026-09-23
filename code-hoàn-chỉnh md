@@ -1,0 +1,1733 @@
+/* =====================================================================
+ *  VN HAXBALL ROOM  —  1v1 • 2v2 • Practice  —  Full hệ thống Admin
+ * ---------------------------------------------------------------------
+ *  CÁCH CHẠY:
+ *   1. Mở https://www.haxball.com/headless
+ *   2. Nhấn F12 → tab Console → dán toàn bộ file này → Enter
+ *   3. (Tuỳ chọn) Lấy token tại https://www.haxball.com/headlesstoken
+ *      rồi điền vào CONFIG.TOKEN để khỏi phải giải reCAPTCHA.
+ *
+ *  Mật khẩu để trống => script tự sinh mật khẩu ngẫu nhiên và in ra Console.
+ *  Đăng nhập trong game:  !login <mật khẩu>
+// ae có thể thay đổi map nha tùy ae và  HINT :để ae chỉnh code thì có thể dùng trên NOTEPAD nha
+ * ===================================================================== */
+"use strict";
+
+/* ═══════════════════════ 1. CẤU HÌNH ═══════════════════════ */
+const CONFIG = {
+  ROOM_NAME: "🏟️ VN HaxBall Pro ",
+  MAX_PLAYERS: 16,
+  PUBLIC: true,
+  ROOM_PASSWORD: null,
+  TOKEN: "", // ae tự lấy token nha
+  GEO: { code: "VN", lat: 21.0285, lon: 105.8542 },
+
+  PASSWORDS: { SUPER: "tuatlabo", ADMIN: "bomaylatuat" },   // để trống = tự sinh ngẫu nhiên
+
+  // ── Đăng nhập / chống dò mật khẩu
+  LOGIN_MAX_FAILS: 3,            // sai quá số lần → khoá đăng nhập
+  LOGIN_LOCK_MS: 10 * 60e3,
+  LOGIN_BAN_FAILS: 6,            // sai quá số lần → ban tạm
+  LOGIN_BAN_MIN: 30,
+
+  // ── Bảo vệ quyền admin
+  ADMIN_ACTIONS_PER_MIN: 5,      // admin thường chỉ được kick/ban/mute tối đa X lần / phút
+  ADMIN_MAX_BAN_MIN: 120,
+  ADMIN_MAX_MUTE_MIN: 60,
+  ADMIN_MAX_BUFF_SEC: 300,
+  SUPER_MAX_BUFF_SEC: 3600,
+  MAX_PER_IP: 2,                 // tối đa kết nối / IP
+  JOIN_FLOOD_COUNT: 8,           // >= 8 lượt vào trong 10s = flood
+  JOIN_FLOOD_WINDOW_MS: 10e3,
+
+  // ── Chat
+  MAX_MSG_LEN: 120,
+  CHAT_WINDOW_MS: 5e3,
+  CHAT_MAX_IN_WINDOW: 4,
+  CHAT_MIN_GAP_MS: 500,
+  DUP_WINDOW_MS: 20e3,
+  STRIKES_TO_MUTE: 3,
+  AUTO_MUTE_MS: 3 * 60e3,
+  AUTO_MUTES_TO_KICK: 3,
+  CMD_COOLDOWN_MS: 400,
+
+  // ── AFK / bóng đứng yên
+  AFK_WARN_MS: 12e3,
+  AFK_MOVE_MS: 22e3,
+  AFK_FLAG_KICK_MS: 30 * 60e3,   // AFK quá lâu trong phòng → kick (0 = tắt)
+  PAUSE_MAX_MS: 90e3,
+  HOLD_MAX_MS: 5 * 60e3,
+
+  // ── Luân chuyển đội
+  MAX_WIN_STREAK: 3,             // thắng liên tiếp X trận → nhường chỗ (0 = không giới hạn)
+  NEXT_MATCH_DELAY_MS: 3e3,
+  MIN_RATED_SECONDS: 20,         // trận ngắn hơn không tính Elo
+};
+
+/* ═══════════════════════ 2. TIỆN ÍCH ═══════════════════════ */
+const Now = () => Date.now();
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const norm = s => String(s).normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+  .replace(/đ/g, "d").replace(/Đ/g, "D").toLowerCase();
+const plain = s => String(s).toLowerCase().replace(/\s+/g, "_");
+const fmtDur = ms => {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return s + "s";
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + "p" + (s % 60 ? (s % 60) + "s" : "");
+  return Math.floor(m / 60) + "h" + (m % 60) + "p";
+};
+const genPass = (n = 10) => {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789";
+  const arr = new Uint32Array(n);
+  try { (globalThis.crypto || window.crypto).getRandomValues(arr); }
+  catch (e) { for (let i = 0; i < n; i++) arr[i] = Math.floor(Math.random() * 4e9); }
+  return Array.from(arr, x => chars[x % chars.length]).join("");
+};
+const C = {
+  super: 0xFFD700, admin: 0x00E5FF, info: 0x9EE7FF, ok: 0x7CFC98,
+  warn: 0xFFB347, err: 0xFF6B6B, sys: 0xC9D1FF, goal: 0xFFFFFF, team: 0xB8FFB0,
+};
+const ROLE = { USER: 0, ADMIN: 1, SUPER: 2 };
+const ROLE_NAME = ["Thành viên", "Admin", "Super Admin"];
+const BADGE = ["", "[ADMIN] ", "[SUPER] "];
+
+/* ═══════════════ 3. BẢN ĐỒ: KÍCH THƯỚC & BỘ DỰNG ═══════════════ */
+// Vật lý chuẩn của người chơi & bóng (dùng cả cho map lẫn hệ thống buff)
+const BASE_PLAYER = { radius: 15, bCoef: 0.5, invMass: 0.5, damping: 0.96 };
+const DEFAULT_BALL_RADIUS = 8;   // 👈 BÓNG NHỎ MẶC ĐỊNH (áp dụng cho mọi map, kể cả map bạn tự dán)
+const BASE_BALL = { radius: DEFAULT_BALL_RADIUS, bCoef: 0.5, invMass: 1, damping: 0.99 };
+
+// Kích thước nửa sân (tính từ tâm). Toàn bộ số liệu khác được suy ra ở deriveDims().
+const DIMS = {
+  "1v1": { size: 1, halfW: 420, halfH: 200, goalHalf: 70,  kickoffR: 62, netDepth: 38 },
+  "2v2": { size: 2, halfW: 620, halfH: 280, goalHalf: 100, kickoffR: 88, netDepth: 46 },
+};
+// Chế độ thi đấu → kích thước sân + luật
+const MODE_INFO = {
+  "1v1":      { size: 1, dim: "1v1", barrier: true,  score: 3, time: 3, label: "1v1" },
+  "2v2":      { size: 2, dim: "2v2", barrier: true,  score: 5, time: 5, label: "2v2" },
+  "practice": { size: 0, dim: "2v2", barrier: false, score: 0, time: 0, label: "Luyện tập" },
+};
+
+function makeSpawns(sign, n, sx, halfH) {
+  if (n <= 1) return [[sign * sx, 0]];
+  const span = Math.min(halfH * 0.75, halfH * 0.3 * (n - 1));
+  const pts = [];
+  for (let i = 0; i < n; i++) pts.push([sign * sx, Math.round(-span + i * (2 * span / (n - 1)))]);
+  return pts;
+}
+
+function deriveDims(m, spawnCount) {
+  const d = {
+    W: m.halfW, H: m.halfH, g: m.goalHalf, cr: m.kickoffR, D: m.netDepth,
+    postR: 8,
+    outerW: m.halfW + 90,          // biên ngoài cùng (người + bóng không thể vượt)
+    outerH: m.halfH + 70,
+    sx: Math.round(m.halfW * 0.5), // khoảng cách điểm xuất phát tới tâm
+  };
+  d.redSpawn = makeSpawns(-1, spawnCount, d.sx, d.H);
+  d.blueSpawn = makeSpawns(1, spawnCount, d.sx, d.H);
+  // ── kiểm tra hợp lệ (chống lỗi bản đồ)
+  const errs = [];
+  if (!(d.g > 30 && d.g < d.H - 20)) errs.push("khung thành không hợp lệ");
+  if (d.cr + BASE_PLAYER.radius * 2 > d.sx) errs.push("vòng giao bóng chạm điểm xuất phát");
+  if (d.D + 20 > d.outerW - d.W) errs.push("lưới vượt biên ngoài");
+  if (d.cr >= d.H - 10) errs.push("vòng giao bóng quá lớn");
+  if (errs.length) throw new Error("Bản đồ lỗi: " + errs.join("; "));
+  return d;
+}
+
+function buildStadium(modeKey) {
+  const mi = MODE_INFO[modeKey], m = DIMS[mi.dim];
+  const d = deriveDims(m, mi.size === 0 ? 8 : mi.size);
+  const vertexes = [], segments = [], planes = [], goals = [], discs = [];
+  const V = (x, y, o) => vertexes.push(Object.assign({ x, y }, o || {})) - 1;
+  const S = (a, b, o) => segments.push(Object.assign({ v0: a, v1: b }, o || {}));
+
+  /* --- Tường chỉ va chạm với bóng (biên sân + đầu khung thành) --- */
+  const BV = { bCoef: 0.5, cMask: ["ball"] };
+  const BW = { vis: false, bCoef: 0.5, cMask: ["ball"] };
+  const c00 = V(-d.W, -d.H, BV), c01 = V(d.W, -d.H, BV);
+  const c11 = V(d.W, d.H, BV), c10 = V(-d.W, d.H, BV);
+  const gl0 = V(-d.W, -d.g, BV), gl1 = V(-d.W, d.g, BV);
+  const gr0 = V(d.W, -d.g, BV), gr1 = V(d.W, d.g, BV);
+  S(c00, c01, BW); S(c10, c11, BW);
+  S(c00, gl0, BW); S(gl1, c10, BW);
+  S(c01, gr0, BW); S(gr1, c11, BW);
+
+  /* --- Lưới quanh cầu môn (bóng dừng lại, người không vào được) --- */
+  const NV = { bCoef: 0.1, cMask: ["ball"] };
+  const NET = (col) => ({ vis: true, bCoef: 0.1, cMask: ["ball"], color: col });
+  const nl0 = V(-d.W - d.D, -d.g, NV), nl1 = V(-d.W - d.D, d.g, NV);
+  S(gl0, nl0, NET("FFCCCC")); S(nl0, nl1, NET("FFCCCC")); S(nl1, gl1, NET("FFCCCC"));
+  const nr0 = V(d.W + d.D, -d.g, NV), nr1 = V(d.W + d.D, d.g, NV);
+  S(gr0, nr0, NET("CCCCFF")); S(nr0, nr1, NET("CCCCFF")); S(nr1, gr1, NET("CCCCFF"));
+  // Chặn người chơi chui vào lưới (chống kẹt / chống bug đứng trong gôn)
+  S(gl0, gl1, { vis: false, bCoef: 0.2, cMask: ["red", "blue"] });
+  S(gr0, gr1, { vis: false, bCoef: 0.2, cMask: ["red", "blue"] });
+
+  /* --- Rào chắn giao bóng (kickoff barrier) --- */
+  if (mi.barrier) {
+    const KO = ["redKO", "blueKO"];
+    const KV = { bCoef: 0.1, cMask: ["red", "blue"], cGroup: KO };
+    const KS = { vis: false, bCoef: 0.1, cMask: ["red", "blue"], cGroup: KO };
+    const t = V(0, -d.outerH, KV), a = V(0, -d.cr, KV), b = V(0, d.cr, KV), u = V(0, d.outerH, KV);
+    S(t, a, KS); S(b, u, KS);       // vạch giữa sân kéo tới biên ngoài
+    // Vòng tròn giữa sân: mỗi nhóm KO có 1 vòng tròn đầy đủ (2 nửa cung)
+    for (const grp of ["redKO", "blueKO"])
+      for (const cv of [180, -180])
+        S(a, b, { curve: cv, vis: false, bCoef: 0.1, cMask: ["red", "blue"], cGroup: [grp] });
+  }
+
+  /* --- Mặt phẳng biên (backup chống bóng/người thoát khỏi map) --- */
+  planes.push(
+    // Người + bóng: biên ngoài cùng
+    { normal: [0, 1],  dist: -d.outerH, bCoef: 0.1, cMask: ["all"] },
+    { normal: [0, -1], dist: -d.outerH, bCoef: 0.1, cMask: ["all"] },
+    { normal: [1, 0],  dist: -d.outerW, bCoef: 0.1, cMask: ["all"] },
+    { normal: [-1, 0], dist: -d.outerW, bCoef: 0.1, cMask: ["all"] },
+    // Chỉ bóng: sát đường biên & đáy lưới
+    { normal: [0, 1],  dist: -d.H, bCoef: 0.5, cMask: ["ball"] },
+    { normal: [0, -1], dist: -d.H, bCoef: 0.5, cMask: ["ball"] },
+    { normal: [1, 0],  dist: -(d.W + d.D), bCoef: 0.1, cMask: ["ball"] },
+    { normal: [-1, 0], dist: -(d.W + d.D), bCoef: 0.1, cMask: ["ball"] }
+  );
+
+  /* --- Khung thành --- */
+  goals.push(
+    { p0: [-d.W, -d.g], p1: [-d.W, d.g], team: "red" },
+    { p0: [d.W, -d.g], p1: [d.W, d.g], team: "blue" }
+  );
+
+  /* --- Bóng (disc 0) + cột gôn --- */
+  discs.push(Object.assign({ pos: [0, 0], color: "FFFFFF", cGroup: ["ball", "kick", "score"] }, BASE_BALL));
+  for (const sx of [-1, 1]) for (const sy of [-1, 1])
+    discs.push({ pos: [sx * d.W, sy * d.g], radius: d.postR, invMass: 0, bCoef: 0.6,
+      color: sx < 0 ? "FFCCCC" : "CCCCFF" });
+
+  return {
+    name: "VN " + mi.label,
+    width: d.outerW, height: d.outerH,
+    spawnDistance: d.sx,
+    redSpawnPoints: d.redSpawn, blueSpawnPoints: d.blueSpawn,
+    bg: { type: "grass", width: d.W, height: d.H, kickOffRadius: d.cr, cornerRadius: 0 },
+    cameraFollow: "ball", canBeStored: false,
+    vertexes, segments, planes, goals, discs,
+    playerPhysics: Object.assign({
+      acceleration: 0.1, kickingAcceleration: 0.07, kickingDamping: 0.96, kickStrength: 5,
+    }, BASE_PLAYER),
+    ballPhysics: "disc0",
+  };
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ *  👉 DÁN BẢN ĐỒ .HBS CỦA BẠN VÀO ĐÂY (dùng cho cả 1v1 / 2v2 / practice)
+ *  - File .hbs thực chất là văn bản JSON — mở file bằng Notepad/VSCode,
+ *    copy TOÀN BỘ nội dung, dán y nguyên vào giữa 2 dấu backtick `...`.
+ *  - Để trống ("") ở ô nào = chế độ đó dùng map mặc định script tự dựng.
+ *  - Cả 3 chế độ đều có thể tự dán map riêng, kể cả "practice".
+ * ───────────────────────────────────────────────────────────────── */      // ae có thể thay đổi map nha tùy ae và để ae chỉnh code thì có thể dùng trên notepad nha
+const CUSTOM_MAPS = {
+  "1v1": `{"name":"Futsal 1v1 by Luchooo from HaxMaps","width":420,"height":200,"spawnDistance":180,"bg":{"type":"hockey","width":368,"height":171,"kickOffRadius":50,"cornerRadius":0},"vertexes":[{"x":-368,"y":171,"bCoef":1,"cMask":["ball"],"trait":"ballArea"},{"x":-368,"y":50,"bCoef":1,"cMask":["ball"],"trait":"ballArea"},{"x":-368,"y":-50,"bCoef":1,"cMask":["ball"],"trait":"ballArea"},{"x":-368,"y":-171,"bCoef":1,"cMask":["ball"],"trait":"ballArea"},{"x":368,"y":171,"bCoef":1,"cMask":["ball"],"trait":"ballArea"},{"x":368,"y":50,"bCoef":1,"cMask":["ball"],"trait":"ballArea"},{"x":368,"y":-50,"bCoef":1,"cMask":["ball"],"trait":"ballArea"},{"x":368,"y":-171,"bCoef":1,"cMask":["ball"],"trait":"ballArea"},{"x":0,"y":176,"trait":"kickOffBarrier"},{"x":0,"y":50,"trait":"kickOffBarrier"},{"x":0,"y":-50,"trait":"line"},{"x":0,"y":-176,"trait":"kickOffBarrier"},{"x":-384,"y":-50,"bCoef":0.1,"cMask":["all"],"trait":"goalNet"},{"x":384,"y":-50,"bCoef":0.1,"cMask":["all"],"trait":"goalNet"},{"x":-384,"y":50,"bCoef":0.1,"cMask":["all"],"trait":"goalNet"},{"x":384,"y":50,"bCoef":0.1,"cMask":["all"],"trait":"goalNet"},{"x":-368,"y":-127,"trait":"line"},{"x":368,"y":-127,"trait":"line"},{"x":-368,"y":127,"trait":"line"},{"x":368,"y":127,"trait":"line"},{"x":-350,"y":-171,"bCoef":0,"trait":"line"},{"x":-368,"y":-163,"bCoef":0,"trait":"line"},{"x":350,"y":-171,"bCoef":0,"trait":"line"},{"x":368,"y":-163,"bCoef":0,"trait":"line"},{"x":-350,"y":171,"bCoef":0,"trait":"line"},{"x":-368,"y":163,"bCoef":0,"trait":"line"},{"x":350,"y":171,"bCoef":0,"trait":"line"},{"x":368,"y":163,"bCoef":0,"trait":"line"},{"x":368,"y":171,"bCoef":1,"trait":"ballArea"},{"x":368,"y":-171,"bCoef":1,"trait":"ballArea"},{"x":0,"y":171,"bCoef":0,"trait":"line"},{"x":0,"y":-171,"bCoef":0,"trait":"line"},{"x":0,"y":50,"trait":"kickOffBarrier"},{"x":0,"y":-50,"trait":"kickOffBarrier"},{"x":377,"y":-50,"bCoef":1,"cMask":["red"],"trait":"line"},{"x":377,"y":-171,"bCoef":1,"cMask":["ball"],"trait":"ballArea"},{"x":-377,"y":-50,"bCoef":1,"cMask":["blue"],"trait":"line"},{"x":-377,"y":-171,"bCoef":1,"cMask":["ball"],"trait":"ballArea"},{"x":-377,"y":50,"bCoef":1,"cMask":["blue"],"trait":"line"},{"x":-377,"y":171,"bCoef":1,"cMask":["ball"],"trait":"ballArea"},{"x":377,"y":50,"bCoef":1,"cMask":["red"],"trait":"line"},{"x":377,"y":171,"bCoef":1,"cMask":["ball"],"trait":"ballArea"}],"segments":[{"v0":0,"v1":1,"trait":"ballArea"},{"v0":2,"v1":3,"trait":"ballArea"},{"v0":4,"v1":5,"trait":"ballArea"},{"v0":6,"v1":7,"trait":"ballArea"},{"v0":8,"v1":9,"trait":"kickOffBarrier"},{"v0":9,"v1":10,"curve":180,"cGroup":["blueKO"],"trait":"kickOffBarrier"},{"v0":9,"v1":10,"curve":-180,"cGroup":["redKO"],"trait":"kickOffBarrier"},{"v0":10,"v1":11,"trait":"kickOffBarrier"},{"v0":2,"v1":12,"curve":-35,"vis":true,"color":"FFFFFF","bCoef":0.1,"cMask":["all"],"trait":"goalNet"},{"v0":6,"v1":13,"curve":35,"vis":true,"color":"FFFFFF","bCoef":0.1,"cMask":["all"],"trait":"goalNet"},{"v0":1,"v1":14,"curve":35,"vis":true,"color":"FFFFFF","bCoef":0.1,"cMask":["all"],"trait":"goalNet"},{"v0":5,"v1":15,"curve":-35,"vis":true,"color":"FFFFFF","bCoef":0.1,"cMask":["all"],"trait":"goalNet"},{"v0":12,"v1":14,"curve":-35,"vis":true,"color":"FFFFFF","bCoef":0.1,"cMask":["all"],"trait":"goalNet","x":-585},{"v0":13,"v1":15,"curve":35,"vis":true,"color":"FFFFFF","bCoef":0.1,"cMask":["all"],"trait":"goalNet","x":585},{"v0":1,"v1":0,"vis":true,"color":"FFFFFF","bCoef":1,"cMask":["ball"],"trait":"ballArea","x":-368},{"v0":5,"v1":4,"vis":true,"color":"FFFFFF","bCoef":1,"cMask":["ball"],"trait":"ballArea","x":368},{"v0":2,"v1":3,"vis":true,"color":"FFFFFF","bCoef":1,"cMask":["ball"],"trait":"ballArea","x":-368},{"v0":6,"v1":7,"vis":true,"color":"FFFFFF","bCoef":1,"cMask":["ball"],"trait":"ballArea","x":368},{"v0":0,"v1":28,"vis":true,"color":"FFFFFF","bCoef":1,"trait":"ballArea","y":171},{"v0":3,"v1":29,"vis":true,"color":"FFFFFF","bCoef":1,"trait":"ballArea","y":-171},{"v0":30,"v1":31,"curve":0,"vis":true,"color":"FFFFFF","bCoef":0,"trait":"line"},{"v0":10,"v1":9,"curve":-180,"vis":true,"color":"FFFFFF","bCoef":0,"trait":"line"},{"v0":33,"v1":32,"curve":180,"vis":true,"color":"FFFFFF","bCoef":0,"trait":"line"},{"v0":2,"v1":1,"curve":0,"vis":true,"color":"FFFFFF","bCoef":0,"trait":"line"},{"v0":6,"v1":5,"curve":0,"vis":true,"color":"FFFFFF","bCoef":0,"trait":"line"},{"v0":34,"v1":35,"vis":false,"color":"FFFFFF","bCoef":1,"cMask":["ball"],"trait":"ballArea","x":330},{"v0":36,"v1":37,"vis":false,"color":"FFFFFF","bCoef":1,"cMask":["ball"],"trait":"ballArea","x":-330},{"v0":38,"v1":39,"vis":false,"color":"FFFFFF","bCoef":1,"cMask":["ball"],"trait":"ballArea","x":-330},{"v0":40,"v1":41,"vis":false,"color":"FFFFFF","bCoef":1,"cMask":["ball"],"trait":"ballArea","x":330},{"v0":34,"v1":40,"curve":60,"vis":false,"color":"FFFFFF","bCoef":1,"cMask":["red"],"trait":"line"},{"v0":38,"v1":36,"curve":60,"vis":false,"color":"FFFFFF","bCoef":1,"cMask":["blue"],"trait":"line"}],"goals":[{"p0":[-372,-52],"p1":[-372,48],"team":"red"},{"p0":[372,50],"p1":[372,-50],"team":"blue"}],"discs":[{"radius":5,"pos":[-368,50],"color":"FFFFFF","trait":"goalPost"},{"radius":5,"pos":[-368,-50],"color":"FFFFFF","trait":"goalPost"},{"radius":5,"pos":[368,50],"color":"FFFFFF","trait":"goalPost"},{"radius":5,"pos":[368,-50],"color":"FFFFFF","trait":"goalPost"},{"radius":3,"invMass":0,"pos":[383,51],"color":"FFFFFF","bCoef":0,"trait":"line"},{"radius":3,"invMass":0,"pos":[-383,51],"color":"FFFFFF","bCoef":0,"trait":"line"},{"radius":3,"invMass":0,"pos":[383,-51],"color":"FFFFFF","bCoef":0,"trait":"line"},{"radius":3,"invMass":0,"pos":[-383,-51],"color":"FFFFFF","bCoef":0,"trait":"line"}],"planes":[{"normal":[0,1],"dist":-171,"trait":"ballArea"},{"normal":[0,-1],"dist":-171,"trait":"ballArea"},{"normal":[0,1],"dist":-200,"bCoef":0.2,"cMask":["all"]},{"normal":[0,-1],"dist":-200,"bCoef":0.2,"cMask":["all"]},{"normal":[1,0],"dist":-420,"bCoef":0.2,"cMask":["all"]},{"normal":[-1,0],"dist":-420,"bCoef":0.2,"cMask":["all"]}],"traits":{"ballArea":{"vis":false,"bCoef":1,"cMask":["ball"]},"goalPost":{"radius":8,"invMass":0,"bCoef":1},"goalNet":{"vis":true,"bCoef":0.1,"cMask":["all"]},"kickOffBarrier":{"vis":false,"bCoef":0.1,"cGroup":["redKO","blueKO"],"cMask":["red","blue"]},"line":{"vis":true,"bCoef":0,"cMask":[""]},"arco":{"radius":2,"cMask":["n\/d"],"color":"cccccc"}},"playerPhysics":{"acceleration":0.11,"kickingAcceleration":0.1,"kickStrength":6.5},"ballPhysics":{"radius":6.4,"color":"EAFF00"}}`,        // ví dụ: `{"name":"...","width":...,"height":...,...}`
+  "2v2": `{"name":"Futsal 1v1 by Luchooo from HaxMaps","width":420,"height":200,"spawnDistance":180,"bg":{"type":"hockey","width":368,"height":171,"kickOffRadius":50,"cornerRadius":0},"vertexes":[{"x":-368,"y":171,"bCoef":1,"cMask":["ball"],"trait":"ballArea"},{"x":-368,"y":50,"bCoef":1,"cMask":["ball"],"trait":"ballArea"},{"x":-368,"y":-50,"bCoef":1,"cMask":["ball"],"trait":"ballArea"},{"x":-368,"y":-171,"bCoef":1,"cMask":["ball"],"trait":"ballArea"},{"x":368,"y":171,"bCoef":1,"cMask":["ball"],"trait":"ballArea"},{"x":368,"y":50,"bCoef":1,"cMask":["ball"],"trait":"ballArea"},{"x":368,"y":-50,"bCoef":1,"cMask":["ball"],"trait":"ballArea"},{"x":368,"y":-171,"bCoef":1,"cMask":["ball"],"trait":"ballArea"},{"x":0,"y":176,"trait":"kickOffBarrier"},{"x":0,"y":50,"trait":"kickOffBarrier"},{"x":0,"y":-50,"trait":"line"},{"x":0,"y":-176,"trait":"kickOffBarrier"},{"x":-384,"y":-50,"bCoef":0.1,"cMask":["all"],"trait":"goalNet"},{"x":384,"y":-50,"bCoef":0.1,"cMask":["all"],"trait":"goalNet"},{"x":-384,"y":50,"bCoef":0.1,"cMask":["all"],"trait":"goalNet"},{"x":384,"y":50,"bCoef":0.1,"cMask":["all"],"trait":"goalNet"},{"x":-368,"y":-127,"trait":"line"},{"x":368,"y":-127,"trait":"line"},{"x":-368,"y":127,"trait":"line"},{"x":368,"y":127,"trait":"line"},{"x":-350,"y":-171,"bCoef":0,"trait":"line"},{"x":-368,"y":-163,"bCoef":0,"trait":"line"},{"x":350,"y":-171,"bCoef":0,"trait":"line"},{"x":368,"y":-163,"bCoef":0,"trait":"line"},{"x":-350,"y":171,"bCoef":0,"trait":"line"},{"x":-368,"y":163,"bCoef":0,"trait":"line"},{"x":350,"y":171,"bCoef":0,"trait":"line"},{"x":368,"y":163,"bCoef":0,"trait":"line"},{"x":368,"y":171,"bCoef":1,"trait":"ballArea"},{"x":368,"y":-171,"bCoef":1,"trait":"ballArea"},{"x":0,"y":171,"bCoef":0,"trait":"line"},{"x":0,"y":-171,"bCoef":0,"trait":"line"},{"x":0,"y":50,"trait":"kickOffBarrier"},{"x":0,"y":-50,"trait":"kickOffBarrier"},{"x":377,"y":-50,"bCoef":1,"cMask":["red"],"trait":"line"},{"x":377,"y":-171,"bCoef":1,"cMask":["ball"],"trait":"ballArea"},{"x":-377,"y":-50,"bCoef":1,"cMask":["blue"],"trait":"line"},{"x":-377,"y":-171,"bCoef":1,"cMask":["ball"],"trait":"ballArea"},{"x":-377,"y":50,"bCoef":1,"cMask":["blue"],"trait":"line"},{"x":-377,"y":171,"bCoef":1,"cMask":["ball"],"trait":"ballArea"},{"x":377,"y":50,"bCoef":1,"cMask":["red"],"trait":"line"},{"x":377,"y":171,"bCoef":1,"cMask":["ball"],"trait":"ballArea"}],"segments":[{"v0":0,"v1":1,"trait":"ballArea"},{"v0":2,"v1":3,"trait":"ballArea"},{"v0":4,"v1":5,"trait":"ballArea"},{"v0":6,"v1":7,"trait":"ballArea"},{"v0":8,"v1":9,"trait":"kickOffBarrier"},{"v0":9,"v1":10,"curve":180,"cGroup":["blueKO"],"trait":"kickOffBarrier"},{"v0":9,"v1":10,"curve":-180,"cGroup":["redKO"],"trait":"kickOffBarrier"},{"v0":10,"v1":11,"trait":"kickOffBarrier"},{"v0":2,"v1":12,"curve":-35,"vis":true,"color":"FFFFFF","bCoef":0.1,"cMask":["all"],"trait":"goalNet"},{"v0":6,"v1":13,"curve":35,"vis":true,"color":"FFFFFF","bCoef":0.1,"cMask":["all"],"trait":"goalNet"},{"v0":1,"v1":14,"curve":35,"vis":true,"color":"FFFFFF","bCoef":0.1,"cMask":["all"],"trait":"goalNet"},{"v0":5,"v1":15,"curve":-35,"vis":true,"color":"FFFFFF","bCoef":0.1,"cMask":["all"],"trait":"goalNet"},{"v0":12,"v1":14,"curve":-35,"vis":true,"color":"FFFFFF","bCoef":0.1,"cMask":["all"],"trait":"goalNet","x":-585},{"v0":13,"v1":15,"curve":35,"vis":true,"color":"FFFFFF","bCoef":0.1,"cMask":["all"],"trait":"goalNet","x":585},{"v0":1,"v1":0,"vis":true,"color":"FFFFFF","bCoef":1,"cMask":["ball"],"trait":"ballArea","x":-368},{"v0":5,"v1":4,"vis":true,"color":"FFFFFF","bCoef":1,"cMask":["ball"],"trait":"ballArea","x":368},{"v0":2,"v1":3,"vis":true,"color":"FFFFFF","bCoef":1,"cMask":["ball"],"trait":"ballArea","x":-368},{"v0":6,"v1":7,"vis":true,"color":"FFFFFF","bCoef":1,"cMask":["ball"],"trait":"ballArea","x":368},{"v0":0,"v1":28,"vis":true,"color":"FFFFFF","bCoef":1,"trait":"ballArea","y":171},{"v0":3,"v1":29,"vis":true,"color":"FFFFFF","bCoef":1,"trait":"ballArea","y":-171},{"v0":30,"v1":31,"curve":0,"vis":true,"color":"FFFFFF","bCoef":0,"trait":"line"},{"v0":10,"v1":9,"curve":-180,"vis":true,"color":"FFFFFF","bCoef":0,"trait":"line"},{"v0":33,"v1":32,"curve":180,"vis":true,"color":"FFFFFF","bCoef":0,"trait":"line"},{"v0":2,"v1":1,"curve":0,"vis":true,"color":"FFFFFF","bCoef":0,"trait":"line"},{"v0":6,"v1":5,"curve":0,"vis":true,"color":"FFFFFF","bCoef":0,"trait":"line"},{"v0":34,"v1":35,"vis":false,"color":"FFFFFF","bCoef":1,"cMask":["ball"],"trait":"ballArea","x":330},{"v0":36,"v1":37,"vis":false,"color":"FFFFFF","bCoef":1,"cMask":["ball"],"trait":"ballArea","x":-330},{"v0":38,"v1":39,"vis":false,"color":"FFFFFF","bCoef":1,"cMask":["ball"],"trait":"ballArea","x":-330},{"v0":40,"v1":41,"vis":false,"color":"FFFFFF","bCoef":1,"cMask":["ball"],"trait":"ballArea","x":330},{"v0":34,"v1":40,"curve":60,"vis":false,"color":"FFFFFF","bCoef":1,"cMask":["red"],"trait":"line"},{"v0":38,"v1":36,"curve":60,"vis":false,"color":"FFFFFF","bCoef":1,"cMask":["blue"],"trait":"line"}],"goals":[{"p0":[-372,-52],"p1":[-372,48],"team":"red"},{"p0":[372,50],"p1":[372,-50],"team":"blue"}],"discs":[{"radius":5,"pos":[-368,50],"color":"FFFFFF","trait":"goalPost"},{"radius":5,"pos":[-368,-50],"color":"FFFFFF","trait":"goalPost"},{"radius":5,"pos":[368,50],"color":"FFFFFF","trait":"goalPost"},{"radius":5,"pos":[368,-50],"color":"FFFFFF","trait":"goalPost"},{"radius":3,"invMass":0,"pos":[383,51],"color":"FFFFFF","bCoef":0,"trait":"line"},{"radius":3,"invMass":0,"pos":[-383,51],"color":"FFFFFF","bCoef":0,"trait":"line"},{"radius":3,"invMass":0,"pos":[383,-51],"color":"FFFFFF","bCoef":0,"trait":"line"},{"radius":3,"invMass":0,"pos":[-383,-51],"color":"FFFFFF","bCoef":0,"trait":"line"}],"planes":[{"normal":[0,1],"dist":-171,"trait":"ballArea"},{"normal":[0,-1],"dist":-171,"trait":"ballArea"},{"normal":[0,1],"dist":-200,"bCoef":0.2,"cMask":["all"]},{"normal":[0,-1],"dist":-200,"bCoef":0.2,"cMask":["all"]},{"normal":[1,0],"dist":-420,"bCoef":0.2,"cMask":["all"]},{"normal":[-1,0],"dist":-420,"bCoef":0.2,"cMask":["all"]}],"traits":{"ballArea":{"vis":false,"bCoef":1,"cMask":["ball"]},"goalPost":{"radius":8,"invMass":0,"bCoef":1},"goalNet":{"vis":true,"bCoef":0.1,"cMask":["all"]},"kickOffBarrier":{"vis":false,"bCoef":0.1,"cGroup":["redKO","blueKO"],"cMask":["red","blue"]},"line":{"vis":true,"bCoef":0,"cMask":[""]},"arco":{"radius":2,"cMask":["n\/d"],"color":"cccccc"}},"playerPhysics":{"acceleration":0.11,"kickingAcceleration":0.1,"kickStrength":6.5},"ballPhysics":{"radius":6.4,"color":"EAFF00"}}`,
+  "practice": `{"name":"Training Futsal Wall by FY [\u029c\u1d00x\u1d0d\u1d0f\u1d05s.\u1d04\u1d0f\u1d0d]","width":420,"height":200,"bg":{"type":"grass","width":420,"height":200,"color":"58A380"},"vertexes":[{"x":424,"y":-2,"cMask":[],"cGroup":[]},{"x":-424,"y":-2,"cMask":[],"cGroup":[]},{"x":424,"y":0,"cMask":[],"cGroup":[]},{"x":-424,"y":0,"cMask":[],"cGroup":[]},{"x":424,"y":2,"cMask":[],"cGroup":[]},{"x":-424,"y":2,"cMask":[],"cGroup":[]},{"x":-424,"y":4,"cMask":[],"cGroup":[]},{"x":-144,"y":-204,"cMask":[],"cGroup":[]},{"x":-144,"y":204,"cMask":[],"cGroup":[]},{"x":-142,"y":-204,"cMask":[],"cGroup":[]},{"x":-142,"y":204,"cMask":[],"cGroup":[]},{"x":-140,"y":-204,"cMask":[],"cGroup":[]},{"x":-140,"y":204,"cMask":[],"cGroup":[]},{"x":-138,"y":-204,"cMask":[],"cGroup":[]},{"x":-138,"y":204,"cMask":[],"cGroup":[]},{"x":138,"y":-204,"cMask":[],"cGroup":[]},{"x":138,"y":204,"cMask":[],"cGroup":[]},{"x":140,"y":-204,"cMask":[],"cGroup":[]},{"x":140,"y":204,"cMask":[],"cGroup":[]},{"x":142,"y":-204,"cMask":[],"cGroup":[]},{"x":142,"y":204,"cMask":[],"cGroup":[]},{"x":144,"y":-204,"cMask":[],"cGroup":[]},{"x":144,"y":204,"cMask":[],"cGroup":[]},{"x":-137,"y":-200,"cMask":["ball"]},{"x":-137,"y":-4,"cMask":["ball"]},{"x":137,"y":-200,"cMask":["ball"]},{"x":137,"y":-4,"cMask":["ball"]},{"x":-137,"y":-200,"cMask":["ball"]},{"x":137,"y":-200,"cMask":["ball"]},{"x":-137,"y":-4,"cMask":["ball"]},{"x":137,"y":-4,"cMask":["ball"]},{"x":-420,"y":-200,"cMask":["ball"]},{"x":-420,"y":-4,"cMask":["ball"]},{"x":-146,"y":-200,"cMask":["ball"]},{"x":-146,"y":-4,"cMask":["ball"]},{"x":-420,"y":-200,"cMask":["ball"]},{"x":-146,"y":-200,"cMask":["ball"]},{"x":-420,"y":-4,"cMask":["ball"]},{"x":-146,"y":-4,"cMask":["ball"]},{"x":-420,"y":4,"cMask":["ball"]},{"x":-420,"y":200,"cMask":["ball"]},{"x":-146,"y":4,"cMask":["ball"]},{"x":-146,"y":200,"cMask":["ball"]},{"x":-420,"y":4,"cMask":["ball"]},{"x":-146,"y":4,"cMask":["ball"]},{"x":-420,"y":200,"cMask":["ball"]},{"x":-146,"y":200,"cMask":["ball"]},{"x":146,"y":-200,"cMask":["ball"]},{"x":146,"y":-4,"cMask":["ball"]},{"x":420,"y":-200,"cMask":["ball"]},{"x":420,"y":-4,"cMask":["ball"]},{"x":146,"y":-200,"cMask":["ball"]},{"x":420,"y":-200,"cMask":["ball"]},{"x":146,"y":-4,"cMask":["ball"]},{"x":420,"y":-4,"cMask":["ball"]},{"x":420,"y":4,"cMask":["ball"]},{"x":420,"y":200,"cMask":["ball"]},{"x":146,"y":4,"cMask":["ball"]},{"x":420,"y":4,"cMask":["ball"]},{"x":146,"y":200,"cMask":["ball"]},{"x":420,"y":200,"cMask":["ball"]},{"x":-137,"y":4,"cMask":["ball"]},{"x":-137,"y":200,"cMask":["ball"]},{"x":-137,"y":4,"cMask":["ball"]},{"x":137,"y":4,"cMask":["ball"]},{"x":-137,"y":200,"cMask":["ball"]},{"x":137,"y":200,"cMask":["ball"]},{"x":283,"y":-200,"cMask":[],"cGroup":[]},{"x":283,"y":-4,"cMask":[],"cGroup":[]},{"x":-283,"y":-200,"cMask":[],"cGroup":[]},{"x":-283,"y":-4,"cMask":[],"cGroup":[]},{"x":-283,"y":200,"cMask":[],"cGroup":[]},{"x":-283,"y":4,"cMask":[],"cGroup":[]},{"x":137,"y":4,"cMask":["ball"]},{"x":137,"y":200,"cMask":["ball"]},{"x":146,"y":4,"cMask":["ball"]},{"x":146,"y":200,"cMask":["ball"]},{"x":283,"y":200,"cMask":[],"cGroup":[]},{"x":283,"y":4,"cMask":[],"cGroup":[]}],"segments":[{"v0":0,"v1":1,"cMask":[],"cGroup":[],"color":"58A380"},{"v0":2,"v1":3,"cMask":[],"cGroup":[],"color":"58A380"},{"v0":4,"v1":5,"cMask":[],"cGroup":[],"color":"58A380"},{"v0":7,"v1":8,"cMask":[],"cGroup":[],"color":"58A380"},{"v0":9,"v1":10,"cMask":[],"cGroup":[],"color":"58A380"},{"v0":11,"v1":12,"cMask":[],"cGroup":[],"color":"58A380"},{"v0":13,"v1":14,"cMask":[],"cGroup":[],"color":"58A380"},{"v0":15,"v1":16,"cMask":[],"cGroup":[],"color":"58A380"},{"v0":17,"v1":18,"cMask":[],"cGroup":[],"color":"58A380"},{"v0":19,"v1":20,"cMask":[],"cGroup":[],"color":"58A380"},{"v0":21,"v1":22,"cMask":[],"cGroup":[],"color":"58A380"},{"v0":23,"v1":24,"cMask":["ball"],"color":"C7E6BD"},{"v0":25,"v1":26,"cMask":["ball"],"color":"C7E6BD"},{"v0":27,"v1":28,"cMask":["ball"],"color":"C7E6BD"},{"v0":29,"v1":30,"cMask":["ball"],"color":"C7E6BD"},{"v0":31,"v1":32,"cMask":["ball"],"color":"C7E6BD"},{"v0":33,"v1":34,"cMask":["ball"],"color":"C7E6BD"},{"v0":35,"v1":36,"cMask":["ball"],"color":"C7E6BD"},{"v0":37,"v1":38,"cMask":["ball"],"color":"C7E6BD"},{"v0":39,"v1":40,"cMask":["ball"],"color":"C7E6BD"},{"v0":41,"v1":42,"cMask":["ball"],"color":"C7E6BD"},{"v0":43,"v1":44,"cMask":["ball"],"color":"C7E6BD"},{"v0":45,"v1":46,"cMask":["ball"],"color":"C7E6BD"},{"v0":47,"v1":48,"cMask":["ball"],"color":"C7E6BD"},{"v0":49,"v1":50,"cMask":["ball"],"color":"C7E6BD"},{"v0":51,"v1":52,"cMask":["ball"],"color":"C7E6BD"},{"v0":53,"v1":54,"cMask":["ball"],"color":"C7E6BD"},{"v0":55,"v1":56,"cMask":["ball"],"color":"C7E6BD"},{"v0":57,"v1":58,"cMask":["ball"],"color":"C7E6BD"},{"v0":59,"v1":60,"cMask":["ball"],"color":"C7E6BD"},{"v0":61,"v1":62,"cMask":["ball"],"color":"C7E6BD"},{"v0":63,"v1":64,"cMask":["ball"],"color":"C7E6BD"},{"v0":65,"v1":66,"cMask":["ball"],"color":"C7E6BD"},{"v0":67,"v1":68,"cMask":[],"cGroup":[],"color":"C7E6BD"},{"v0":69,"v1":70,"cMask":[],"cGroup":[],"color":"C7E6BD"},{"v0":71,"v1":72,"cMask":[],"cGroup":[],"color":"C7E6BD"},{"v0":73,"v1":74,"cMask":["ball"],"color":"C7E6BD"},{"v0":75,"v1":76,"cMask":["ball"],"color":"C7E6BD"},{"v0":77,"v1":78,"cMask":[],"cGroup":[],"color":"C7E6BD"}],"planes":[{"normal":[0,1],"dist":-250,"bCoef":0.1},{"normal":[0,-1],"dist":-250,"bCoef":0.1},{"normal":[1,0],"dist":-500,"bCoef":0.1},{"normal":[-1,0],"dist":-500,"bCoef":0.1},{"normal":[0,1],"dist":-200,"cGroup":["c0","c1","c2"]},{"normal":[0,-1],"dist":-200,"cGroup":["c3"]},{"normal":[0,-1],"dist":4,"cGroup":["c0","c1","c2"]},{"normal":[0,1],"dist":4,"cGroup":["c3"]},{"normal":[1,0],"dist":-420,"cGroup":["c0","c1","c2"]},{"normal":[-1,0],"dist":-420,"cGroup":["c0","c1","c2"]},{"normal":[-1,0],"dist":146,"cGroup":["c0"]},{"normal":[1,0],"dist":-137,"cGroup":["c1"]},{"normal":[-1,0],"dist":-137,"cGroup":["c1"]},{"normal":[1,0],"dist":146,"cGroup":["c2"]},{"normal":[1,0],"dist":-420,"cGroup":["c3"]},{"normal":[-1,0],"dist":146,"cGroup":["c3"]},{"normal":[0,-1],"dist":-200,"cGroup":["kick","score"]},{"normal":[0,1],"dist":4,"cGroup":["kick","score"]},{"normal":[1,0],"dist":-137,"cGroup":["kick","score"]},{"normal":[-1,0],"dist":-420,"cGroup":["kick","score"]},{"normal":[-1,0],"dist":-137,"cGroup":["score"]},{"normal":[1,0],"dist":146,"cGroup":["kick"]}],"goals":[],"discs":[{"pos":[461,229],"radius":0.01,"invMass":1.0e-7,"cMask":["wall"],"cGroup":["ball","kick"]},{"pos":[-283,-97],"radius":6,"color":"7CFC00","cMask":["red","blue","ball","c0"],"cGroup":["ball","kick"]},{"pos":[0,-97],"radius":6,"color":"7CFC00","cMask":["red","blue","ball","c1"],"cGroup":["ball","kick"]},{"pos":[283,-97],"radius":6,"color":"7CFC00","cMask":["red","blue","ball","c2"],"cGroup":["ball","kick"]},{"pos":[-283,97],"radius":6,"color":"7CFC00","cMask":["red","blue","ball","c3"],"cGroup":["ball","kick"]},{"pos":[0,97],"radius":6,"color":"7CFC00","cMask":["red","blue","ball","score"],"cGroup":["ball","kick"]},{"pos":[283,97],"radius":6,"color":"7CFC00","cMask":["red","blue","ball","kick"],"cGroup":["ball","kick"]}],"playerPhysics":{"invMass":0.3,"acceleration":0.105,"kickingAcceleration":0.073,"kickingDamping":0.97,"kickStrength":5.7,"radius":15.9852},"ballPhysics":"disc0","cameraFollow":"player","redSpawnPoints":[[-351,-97],[-68,-97],[351,-97],[-351,97],[-68,97],[351,97]],"blueSpawnPoints":[[-214,-97],[68,-97],[214,-97],[-214,97],[68,97],[214,97]],"canBeStored":true}`,
+};
+
+// Ước lượng vùng biên (để hệ thống chống bug/AFK dùng) từ 1 map JSON tuỳ ý
+function geoFromCustomMap(json) {
+  const w = Math.abs(json.width) || 420, h = Math.abs(json.height) || 200;
+  return {
+    outerW: w, outerH: h,
+    sx: Math.abs(json.spawnDistance) || Math.round(w * 0.4),
+    H: h * 0.8, W: w * 0.8,
+  };
+}
+
+const STADIUM_JSON = {}, GEO = {};
+for (const k of Object.keys(MODE_INFO)) {
+  const custom = (CUSTOM_MAPS[k] || "").trim();
+  if (custom) {
+    try {
+      const parsed = JSON.parse(custom);
+      STADIUM_JSON[k] = JSON.stringify(parsed);   // chuẩn hoá lại chuỗi JSON
+      GEO[k] = geoFromCustomMap(parsed);
+      console.log(`[VN-HAX] Đã nạp map tuỳ chỉnh cho ${k}: "${parsed.name || k}"`);
+    } catch (e) {
+      console.error(`[VN-HAX] Map tuỳ chỉnh "${k}" bị lỗi JSON, dùng map mặc định thay thế:`, e);
+      STADIUM_JSON[k] = JSON.stringify(buildStadium(k));
+      GEO[k] = deriveDims(DIMS[MODE_INFO[k].dim], 2);
+    }
+  } else {
+    STADIUM_JSON[k] = JSON.stringify(buildStadium(k));   // không dán map → dùng map mặc định script tự dựng
+    GEO[k] = deriveDims(DIMS[MODE_INFO[k].dim], 2);
+  }
+}
+
+// Ghi nhớ đúng vật lý bóng GỐC của từng map (kể cả map bạn tự dán) để "!ballbuff off" trả bóng về đúng như map gốc
+const BALL_ENGINE_DEFAULT = { radius: 10, invMass: 1, bCoef: 0.5, damping: 0.99 };
+const ORIGINAL_BALL = {};
+for (const k of Object.keys(STADIUM_JSON)) {
+  try {
+    const parsed = JSON.parse(STADIUM_JSON[k]);
+    const d0 = (parsed.discs && parsed.discs[0]) || {};
+    ORIGINAL_BALL[k] = Object.assign({}, BALL_ENGINE_DEFAULT, {
+      radius: d0.radius != null ? d0.radius : BALL_ENGINE_DEFAULT.radius,
+      invMass: d0.invMass != null ? d0.invMass : BALL_ENGINE_DEFAULT.invMass,
+      bCoef: d0.bCoef != null ? d0.bCoef : BALL_ENGINE_DEFAULT.bCoef,
+      damping: d0.damping != null ? d0.damping : BALL_ENGINE_DEFAULT.damping,
+    });
+  } catch (e) { ORIGINAL_BALL[k] = BALL_ENGINE_DEFAULT; }
+}
+
+/* ═══════════════════ 4. LƯU TRỮ (stats / staff / ban) ═══════════════════ */
+const Store = (() => {
+  const KEY = "vnhax_room_v1", FILE = "./vnhax_data.json";
+  let ls = null, fs = null, dirty = false;
+  try { ls = typeof localStorage !== "undefined" ? localStorage : null; } catch (e) { ls = null; }
+  try { if (!ls && typeof require === "function") fs = require("fs"); } catch (e) { fs = null; }
+  let data = { stats: {}, staff: {}, bans: [], econ: {}, codes: {} };
+  function load() {
+    try {
+      let raw = null;
+      if (ls) raw = ls.getItem(KEY);
+      else if (fs && fs.existsSync(FILE)) raw = fs.readFileSync(FILE, "utf8");
+      if (raw) data = Object.assign(data, JSON.parse(raw));
+    } catch (e) { console.warn("[Store] load lỗi:", e); }
+  }
+  function save() {
+    try {
+      const raw = JSON.stringify(data);
+      if (ls) ls.setItem(KEY, raw); else if (fs) fs.writeFileSync(FILE, raw);
+      dirty = false;
+    } catch (e) { console.warn("[Store] save lỗi:", e); }
+  }
+  return { get data() { return data; }, load, save, touch() { dirty = true; }, flush() { if (dirty) save(); } };
+})();
+Store.load();
+
+/* ═══════════════════ 5. KHỞI TẠO PHÒNG & TRẠNG THÁI ═══════════════════ */
+if (!CONFIG.PASSWORDS.SUPER) CONFIG.PASSWORDS.SUPER = genPass(12);
+if (!CONFIG.PASSWORDS.ADMIN) CONFIG.PASSWORDS.ADMIN = genPass(10);
+console.log("%c[VN-HAX] SUPER ADMIN password: " + CONFIG.PASSWORDS.SUPER, "color:gold;font-size:14px");
+console.log("%c[VN-HAX] ADMIN password: " + CONFIG.PASSWORDS.ADMIN, "color:cyan;font-size:14px");
+
+const roomCfg = { roomName: CONFIG.ROOM_NAME, maxPlayers: CONFIG.MAX_PLAYERS, public: CONFIG.PUBLIC, noPlayer: true, geo: CONFIG.GEO };
+if (CONFIG.TOKEN) roomCfg.token = CONFIG.TOKEN;
+if (CONFIG.ROOM_PASSWORD) roomCfg.password = CONFIG.ROOM_PASSWORD;
+const room = HBInit(roomCfg);
+
+const S = {
+  players: new Map(),      // id → hồ sơ người chơi
+  gone: new Map(),         // người vừa rời (giữ 15s để xử lý onPlayerKicked)
+  queue: [],               // hàng chờ (id)
+  mode: "practice",        // chế độ đang chạy
+  modeSetting: "auto",     // auto | 1v1 | 2v2 | practice
+  mapKey: null,
+  limits: { score: null, time: null },
+  winnerTeam: 0, winStreak: 0, champTeam: 0,
+  result: null, match: null,
+  hold: false, holdUntil: 0,
+  planTimer: null, balTimer: null,
+  paused: false, pausedAt: 0,
+  kickoffWaiting: true, kickoffTeam: 1,
+  touches: [],
+  buffs: new Map(), ballBuff: null,
+  bets: { winner: {}, scorer: {} }, betsLocked: false,
+  mutes: new Map(),        // auth → {until, reason, by}
+  chatLocked: false, slowMs: 0,
+  loginFails: new Map(),   // auth → {n, lockUntil}
+  joinTimes: [], captchaUntil: 0,
+  audit: [], lastSave: Now(),
+};
+
+const running = () => room.getScores() !== null;
+const list = () => room.getPlayerList().filter(p => S.players.has(p.id));
+const teamIds = t => list().filter(p => p.team === t).map(p => p.id);
+const rec = id => S.players.get(id);
+const eligible = () => [...S.players.values()].filter(p => !p.afk);
+const say = (m, color = C.sys, style = "normal", sound = 0) => room.sendAnnouncement(m, null, color, style, sound);
+const tell = (id, m, color = C.info, style = "normal", sound = 0) => room.sendAnnouncement(m, id, color, style, sound);
+function wrap(text, n = 125) {
+  const out = [];
+  for (const line of String(text).split("\n")) {
+    let cur = "";
+    for (const w of line.split(" ")) {
+      if ((cur + " " + w).trim().length > n) { out.push(cur); cur = w; } else cur = (cur + " " + w).trim();
+    }
+    out.push(cur);
+  }
+  return out;
+}
+const tellLines = (id, text, color) => wrap(text).forEach(l => tell(id, l, color));
+function logErr(where, e) { console.error("[VN-HAX] Lỗi tại " + where + ":", e); }
+function audit(text) {
+  const line = new Date().toLocaleTimeString("vi-VN") + " " + text;
+  S.audit.push(line); if (S.audit.length > 200) S.audit.shift();
+  console.log("[AUDIT] " + line);
+}
+function alertSupers(text) {
+  for (const p of S.players.values()) if (p.role === ROLE.SUPER) tell(p.id, "🚨 " + text, C.err, "bold", 2);
+}
+function on(name, fn, onErr) {
+  room[name] = (...args) => { try { return fn(...args); } catch (e) { logErr(name, e); return onErr; } };
+}
+
+/* ═══════════════ 6. PHÂN QUYỀN / ĐĂNG NHẬP / BAN / MUTE ═══════════════ */
+function setRole(p, role, remember) {
+  p.role = role;
+  try { room.setPlayerAdmin(p.id, role >= 1); } catch (e) {}
+  try { room.setPlayerAvatar(p.id, role === 2 ? "👑" : role === 1 ? "⚡" : null); } catch (e) {}
+  if (p.realAuth) {
+    if (remember && role > 0) Store.data.staff[p.auth] = { role, name: p.name, at: Now() };
+    if (role === 0) delete Store.data.staff[p.auth];
+    Store.touch();
+  }
+}
+
+function findBan(auth, conn) {
+  const t = Now(), bans = Store.data.bans;
+  for (let i = bans.length - 1; i >= 0; i--) if (bans[i].until && bans[i].until <= t) bans.splice(i, 1);
+  return bans.find(b => (auth && b.auth === auth) || (conn && b.conn === conn));
+}
+function addBan(target, minutes, reason, byName, kick = true) {
+  Store.data.bans.push({ auth: target.auth, conn: target.conn, name: target.name, reason,
+    by: byName, at: Now(), until: minutes > 0 ? Now() + minutes * 60e3 : 0 });
+  Store.save();
+  if (kick && S.players.has(target.id))
+    room.kickPlayer(target.id, `Bị ban${minutes ? " " + minutes + " phút" : " vĩnh viễn"}: ${reason}`, false);
+}
+function getMute(p) {
+  const m = S.mutes.get(p.auth);
+  if (!m) return null;
+  if (m.until && m.until <= Now()) { S.mutes.delete(p.auth); return null; }
+  return m;
+}
+// Giới hạn tần suất hành động kiểm duyệt của admin thường
+function guard(p) {
+  if (p.role >= ROLE.SUPER) return true;
+  const t = Now();
+  p.acts = p.acts.filter(x => t - x < 60e3);
+  p.acts.push(t);
+  if (p.acts.length > CONFIG.ADMIN_ACTIONS_PER_MIN) {
+    tell(p.id, "⛔ Bạn thao tác kiểm duyệt quá nhanh. Chờ một chút.", C.err);
+    alertSupers(`${p.name} (Admin) thao tác kiểm duyệt bất thường (${p.acts.length}/phút).`);
+    if (p.acts.length > CONFIG.ADMIN_ACTIONS_PER_MIN + 3) {
+      setRole(p, ROLE.USER); audit(`Tự động hạ quyền ${p.name} do lạm dụng`);
+      say(`🛑 ${p.name} bị tước quyền admin do lạm dụng.`, C.err);
+    }
+    return false;
+  }
+  return true;
+}
+
+/* ═══════════════════ 7. BUFF ═══════════════════ */
+const BUFFS = {
+  speed:  { label: "⚡ Tốc độ",     role: 1, props: { damping: 0.9685 } },
+  giant:  { label: "🗿 Khổng lồ",   role: 1, props: { radius: 22, invMass: 0.3 } },
+  tiny:   { label: "🐜 Tí hon",     role: 1, props: { radius: 10, invMass: 0.8 } },
+  tank:   { label: "🛡️ Xe tăng",    role: 1, props: { invMass: 0.18 } },
+  bouncy: { label: "🏀 Nảy",        role: 1, props: { bCoef: 1.1 } },
+  turbo:  { label: "🚀 Siêu tốc",   role: 2, props: { damping: 0.974 } },
+  god:    { label: "👑 Thần thánh", role: 2, props: { radius: 19, invMass: 0.25, damping: 0.972 } },
+};
+const BALL_BUFFS = {
+  fast: { damping: 0.996 }, slow: { damping: 0.982 }, big: { radius: 15 },
+  small: { radius: 7 }, heavy: { invMass: 0.55 }, light: { invMass: 1.8 }, bouncy: { bCoef: 0.95 },
+};
+function sanitizeProps(o) {   // kẹp giá trị để buff không phá vật lý
+  const r = {};
+  if ("radius" in o) r.radius = clamp(o.radius, 6, 30);
+  if ("invMass" in o) r.invMass = clamp(o.invMass, 0.1, 2.5);
+  if ("damping" in o) r.damping = clamp(o.damping, 0.9, 0.998);
+  if ("bCoef" in o) r.bCoef = clamp(o.bCoef, 0, 1.5);
+  return r;
+}
+function unrate(reason) {
+  if (S.match && S.match.rated) { S.match.rated = false; say(`ℹ️ Trận này KHÔNG tính thống kê (${reason}).`, C.warn); }
+}
+function applyPlayerBuff(id) {
+  const b = S.buffs.get(id); if (!b) return;
+  const pl = room.getPlayer(id);
+  if (!pl || pl.team === 0 || !running()) return;
+  try { room.setPlayerDiscProperties(id, sanitizeProps(BUFFS[b.type].props)); } catch (e) {}
+}
+function removePlayerBuff(id, resetDisc = true) {
+  S.buffs.delete(id);
+  if (resetDisc && running()) { try { room.setPlayerDiscProperties(id, BASE_PLAYER); } catch (e) {} }
+}
+function applyBallBuff() {
+  // Chỉ chỉnh bóng khi Super Admin CHỦ ĐỘNG dùng !ballbuff. Không tự động ép size —
+  // để bóng giữ đúng theo map (kể cả map futsal/1v1 bóng nhỏ bạn tự dán).
+  if (!running() || !S.ballBuff) return;
+  try { room.setDiscProperties(0, sanitizeProps(BALL_BUFFS[S.ballBuff])); } catch (e) {}
+}
+function reapplyBuffs() {
+  setTimeout(() => { try { for (const id of S.buffs.keys()) applyPlayerBuff(id); applyBallBuff(); } catch (e) { logErr("reapplyBuffs", e); } }, 0);
+}
+function clearBuffs() { S.buffs.clear(); S.ballBuff = null; }
+
+/* ═══════════════════ 8. HÀNG CHỜ & ĐỘI HÌNH ═══════════════════ */
+function syncQueue() {
+  const specs = list().filter(p => p.team === 0 && !rec(p.id).afk).map(p => p.id);
+  const set = new Set(specs);
+  S.queue = S.queue.filter(id => set.has(id));
+  for (const id of specs) if (!S.queue.includes(id)) S.queue.push(id);
+}
+function toSpec(id, front = false) {
+  room.setPlayerTeam(id, 0);
+  S.queue = S.queue.filter(x => x !== id);
+  if (front) S.queue.unshift(id); else S.queue.push(id);
+}
+function fillTeams(T) {
+  syncQueue();
+  const cnt = { 1: teamIds(1).length, 2: teamIds(2).length };
+  let guardN = 32;
+  while (S.queue.length && guardN-- > 0) {
+    const n1 = T - cnt[1], n2 = T - cnt[2];
+    if (n1 <= 0 && n2 <= 0) break;
+    const team = n1 >= n2 ? 1 : 2;
+    const id = S.queue.shift();
+    room.setPlayerTeam(id, team); cnt[team]++;
+  }
+}
+function evenOut() {
+  const a = teamIds(1), b = teamIds(2);
+  let g = 8;
+  while (Math.abs(a.length - b.length) > 1 && g-- > 0) {
+    const bigIsA = a.length > b.length, big = bigIsA ? a : b, small = bigIsA ? b : a;
+    const id = big.pop();
+    room.setPlayerTeam(id, bigIsA ? 2 : 1); small.push(id);
+  }
+}
+function pickMode() {
+  if (S.modeSetting !== "auto") return S.modeSetting;
+  const n = eligible().length;
+  if (n <= 1) return "practice";
+  return n >= 4 ? "2v2" : "1v1";
+}
+function applyStadium(key) {
+  if (S.mapKey === key) return;
+  try { room.setCustomStadium(STADIUM_JSON[key]); S.mapKey = key; }
+  catch (e) { logErr("setCustomStadium", e); try { room.setDefaultStadium("Classic"); S.mapKey = "classic"; } catch (e2) {} }
+}
+function applyLimits(key) {
+  const mi = MODE_INFO[key];
+  room.setScoreLimit(S.limits.score != null && key !== "practice" ? S.limits.score : mi.score);
+  room.setTimeLimit(S.limits.time != null && key !== "practice" ? S.limits.time : mi.time);
+}
+function schedulePlan(delay) {
+  if (S.planTimer) clearTimeout(S.planTimer);
+  S.planTimer = setTimeout(() => { try { plan(); } catch (e) { logErr("plan", e); S.planTimer = null; } }, delay);
+}
+function restartRound(reason) {
+  if (reason) say(reason, C.warn);
+  S.result = null; S.winnerTeam = 0;
+  if (running()) room.stopGame(); else schedulePlan(500);
+}
+
+// Dựng đội hình & bắt đầu trận (chỉ chạy khi game đang dừng)
+function plan() {
+  S.planTimer = null;
+  if (running()) return;
+  if (S.hold) { if (Now() > S.holdUntil) S.hold = false; else return; }
+  if (eligible().length === 0) return;
+
+  const key = pickMode();
+  const T = MODE_INFO[key].size;
+  S.mode = key;
+  const winnerTeam = S.winnerTeam; S.winnerTeam = 0;
+
+  // AFK luôn ở khán đài
+  for (const p of list()) if (rec(p.id).afk && p.team !== 0) room.setPlayerTeam(p.id, 0);
+  syncQueue();
+
+  if (key === "practice") {
+    for (const p of list()) if (!rec(p.id).afk) room.setPlayerTeam(p.id, 1);
+    S.queue = []; S.winStreak = 0; S.champTeam = 0;
+  } else {
+    if (winnerTeam) {
+      const loser = 3 - winnerTeam;
+      teamIds(loser).forEach(id => toSpec(id));                   // thua → cuối hàng chờ
+      if (winnerTeam === S.champTeam) S.winStreak++; else { S.winStreak = 1; S.champTeam = winnerTeam; }
+      if (CONFIG.MAX_WIN_STREAK && S.winStreak >= CONFIG.MAX_WIN_STREAK && S.queue.length) {
+        const w = teamIds(winnerTeam);
+        say(`🔁 Đội thắng đủ ${S.winStreak} trận liên tiếp — nhường sân cho người chờ!`, C.info);
+        w.forEach(id => toSpec(id)); S.winStreak = 0; S.champTeam = 0;
+      }
+    } else { S.winStreak = 0; S.champTeam = 0; }
+    // Cắt bớt nếu chế độ mới nhỏ hơn (người dư lên ĐẦU hàng chờ)
+    const extras = [];
+    for (const t of [1, 2]) { const ids = teamIds(t); while (ids.length > T) extras.push(ids.pop()); }
+    extras.forEach(id => room.setPlayerTeam(id, 0));
+    S.queue = extras.concat(S.queue.filter(id => !extras.includes(id)));
+    fillTeams(T);
+    evenOut();
+    syncQueue();
+  }
+
+  applyStadium(key);
+  applyLimits(key);
+  room.startGame();
+}
+
+// Cân bằng đội khi đang chơi (có người thoát / AFK / vào)
+function scheduleBalance() {
+  if (S.balTimer) return;
+  S.balTimer = setTimeout(() => { S.balTimer = null; try { checkBalance(); } catch (e) { logErr("checkBalance", e); } }, 80);
+}
+function checkBalance() {
+  if (!running()) { if (!S.planTimer) schedulePlan(1200); return; }
+  syncQueue();
+  if (S.mode === "practice") {
+    const n = eligible().length;
+    if (S.modeSetting === "auto" && n >= 2) return restartRound("⚔️ Đủ người — chuyển sang thi đấu!");
+    for (const p of list()) if (p.team === 0 && !rec(p.id).afk) room.setPlayerTeam(p.id, 1);
+    if (n === 0) room.stopGame();
+    return;
+  }
+  const T = MODE_INFO[S.mode].size;
+  fillTeams(T);
+  const r = teamIds(1).length, b = teamIds(2).length;
+  if (r === 0 || b === 0) return restartRound("⚖️ Một đội hết người — dựng lại đội hình...");
+  if (S.modeSetting === "auto" && (r < T || b < T) && pickMode() !== S.mode)
+    return restartRound(`⚖️ Không đủ người cho ${S.mode} — chuyển chế độ ${pickMode()}...`);
+  if (Math.abs(r - b) > 1) evenOut();
+  if (teamIds(1).length !== teamIds(2).length) unrate("số người 2 đội không bằng nhau");
+}
+
+function moveAfk(p, reason) {
+  p.afk = true; p.afkSince = Now(); p.afkWarned = false;
+  removePlayerBuff(p.id);
+  room.setPlayerTeam(p.id, 0);
+  syncQueue();
+  tell(p.id, `💤 ${reason}. Gõ !back để quay lại hàng chờ.`, C.warn, "bold", 2);
+  say(`💤 ${p.name} bị chuyển sang AFK.`, C.sys, "small");
+  scheduleBalance();
+}
+
+/* ═══════════════════ 9. THỐNG KÊ ═══════════════════ */
+function stat(auth, name) {
+  const s = Store.data.stats;
+  if (!s[auth]) s[auth] = { name, games: 0, wins: 0, losses: 0, goals: 0, assists: 0, og: 0, cs: 0, rating: 1000, leaves: 0, last: Now() };
+  s[auth].name = name; s[auth].last = Now();
+  return s[auth];
+}
+function rankOf(auth) {
+  const all = Object.entries(Store.data.stats).filter(([, v]) => v.games > 0).sort((a, b) => b[1].rating - a[1].rating);
+  const i = all.findIndex(([k]) => k === auth);
+  return i < 0 ? null : i + 1;
+}
+function commitMatch() {
+  const m = S.match, res = S.result; S.match = null;
+  if (!m || !m.rated) return;
+  for (const [auth, x] of Object.entries(m.pl)) {
+    const s = stat(auth, x.name); s.goals += x.g; s.assists += x.a; s.og += x.og;
+  }
+  Store.touch();
+  if (!res || res.time < CONFIG.MIN_RATED_SECONDS) return;
+  const team = { 1: list().filter(p => p.team === 1), 2: list().filter(p => p.team === 2) };
+  if (!team[1].length || !team[2].length) return;
+  const avg = t => team[t].reduce((a, p) => a + stat(rec(p.id).auth, p.name).rating, 0) / team[t].length;
+  const ra = avg(1), rb = avg(2), K = 24;
+  const e1 = 1 / (1 + Math.pow(10, (rb - ra) / 400));
+  const win = res.winner, eWin = win === 1 ? e1 : 1 - e1;
+  const gain = Math.max(1, Math.round(K * (1 - eWin)));
+  const lines = [];
+  for (const t of [1, 2]) for (const p of team[t]) {
+    const s = stat(rec(p.id).auth, p.name), won = t === win;
+    const pr = rec(p.id), ec = econ(pr.auth, pr.name);
+    let delta = won ? gain : -gain;
+    if (!won && ec.eloGuard) { delta = 0; ec.eloGuard = false; tell(p.id, "🛡️ Bảo hộ ELO đã dùng: không bị trừ điểm!", C.info, "bold"); }
+    s.games++; won ? s.wins++ : s.losses++;
+    s.rating = Math.max(0, s.rating + delta);
+    const conceded = t === 1 ? res.blue : res.red;
+    if (won && conceded === 0) s.cs++;
+    lines.push(`${p.name} ${delta >= 0 ? "+" : ""}${delta} (${s.rating})`);
+    if (won) {
+      const mult = vipMult(ec) * (ec.x2GamesLeft > 0 ? 2 : 1);
+      if (ec.x2GamesLeft > 0) ec.x2GamesLeft--;
+      const earn = Math.floor(ECO.WIN_COINS * mult);
+      ec.coins += earn;
+      tell(p.id, `🎁 Thắng trận: +${earn.toLocaleString()} xu`, C.ok);
+    }
+  }
+  say("📈 Elo: " + lines.join(" | "), C.info, "small");
+  resolveWinnerBets(win);
+  Store.save();
+}
+
+/* ═══════════════════ 10. CHAT: LỌC & CHỐNG SPAM ═══════════════════ */
+const BAD_EXACT = new Set(["dm", "dmm", "dcm", "dcmm", "vcl", "vkl", "clm", "cmm", "dmcs", "loz", "fuck", "fck", "shit", "bitch"]);
+const BAD_RAW = new Set(["địt", "đụ", "lồn", "cặc", "đĩ", "đéo"]);
+const BAD_SQUASH = ["ditme", "ditmemay", "concac", "thangcho", "nigger", "nigga", "faggot", "fuckyou"];
+const RE_LINK = /(https?:\/\/|www\.|discord\.gg|\.(com|net|gg|io|vn|xyz|tk)\b)/i;
+
+function filterChat(p, msg) {
+  const t = Now();
+  if (S.chatLocked && p.role < 1) return "Chat đang bị khoá bởi quản trị.";
+  const mute = getMute(p);
+  if (mute) return `Bạn đang bị mute${mute.until ? " (còn " + fmtDur(mute.until - t) + ")" : ""}: ${mute.reason}`;
+  if (p.role >= 1) return null;   // staff miễn lọc
+
+  if (S.slowMs && t - p.lastChat < S.slowMs) return `Chế độ chậm: chờ ${Math.ceil((S.slowMs - (t - p.lastChat)) / 1000)}s.`;
+  if (t - p.lastChat < CONFIG.CHAT_MIN_GAP_MS) return violation(p, "Gõ quá nhanh");
+  p.msgTimes = p.msgTimes.filter(x => t - x < CONFIG.CHAT_WINDOW_MS);
+  if (p.msgTimes.length >= CONFIG.CHAT_MAX_IN_WINDOW) return violation(p, "Spam tin nhắn");
+
+  const n = norm(msg);
+  if (msg.length > CONFIG.MAX_MSG_LEN) return violation(p, "Tin nhắn quá dài");
+  if (n === p.lastNorm && t - p.lastChat < CONFIG.DUP_WINDOW_MS) return violation(p, "Lặp lại tin nhắn");
+  if (/(.)\1{6,}/u.test(msg)) return violation(p, "Lặp ký tự quá nhiều");
+  const letters = msg.replace(/[^\p{L}]/gu, "");
+  if (letters.length >= 8 && letters.replace(/[^\p{Lu}]/gu, "").length / letters.length > 0.7) return violation(p, "Đừng VIẾT HOA toàn bộ");
+  if (RE_LINK.test(msg)) return violation(p, "Không được gửi link/quảng cáo");
+  const tokens = n.split(/[^a-z0-9]+/).filter(Boolean);
+  const rawTokens = msg.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+  const squash = n.replace(/[^a-z0-9]/g, "");
+  if (tokens.some(w => BAD_EXACT.has(w)) || rawTokens.some(w => BAD_RAW.has(w)) || BAD_SQUASH.some(w => squash.includes(w)))
+    return violation(p, "Ngôn từ không phù hợp");
+
+  p.msgTimes.push(t); p.lastChat = t; p.lastNorm = n;
+  return null;
+}
+function violation(p, why) {
+  const t = Now();
+  if (t - p.lastStrike > 60e3) p.strikes = 0;
+  p.strikes++; p.lastStrike = t;
+  if (p.strikes >= CONFIG.STRIKES_TO_MUTE) {
+    p.strikes = 0; p.autoMutes++;
+    S.mutes.set(p.auth, { until: t + CONFIG.AUTO_MUTE_MS, reason: "Vi phạm chat liên tục", by: "AutoMod" });
+    say(`🔇 ${p.name} bị AutoMod mute ${fmtDur(CONFIG.AUTO_MUTE_MS)}.`, C.warn);
+    if (p.autoMutes >= CONFIG.AUTO_MUTES_TO_KICK) {
+      addBan(p, 10, "Spam chat lặp lại", "AutoMod");
+    }
+    return why + " — bạn đã bị mute.";
+  }
+  return `${why} (cảnh cáo ${p.strikes}/${CONFIG.STRIKES_TO_MUTE})`;
+}
+
+/* ═══════════════════ 10.5. KINH TẾ: XU · RUBY · SHOP · CƯỢC TRẬN · MINIGAME ═══════════════════ */
+const ECO = {
+  START_COINS: 300,
+  DAILY_BASE: 200, DAILY_STREAK_BONUS: 20, DAILY_STREAK_CAP: 300,
+  WIN_COINS: 500,
+  BET_HOUSE_EDGE: 0.92, BET_MAX_MULT: 30, BET_SCORER_MULT: 5,
+  RUBY_BUY_RATE: 15000,       // mua 1 ruby = 15.000 xu
+  MAX_STAKE: 5_000_000,       // trần cược/minigame 1 lượt
+};
+let rubySellRate = 8000;
+setInterval(() => { rubySellRate = 6000 + Math.floor(Math.random() * 4000); }, 5 * 60e3);
+
+function isPosInt(n, max = ECO.MAX_STAKE) { return Number.isSafeInteger(n) && n > 0 && n <= max; }
+function econ(auth, name) {
+  const e = Store.data.econ;
+  if (!e[auth]) e[auth] = {
+    name, coins: ECO.START_COINS, ruby: 0,
+    chatColor: null, title: null, titles: [],
+    vipTier: 0, vipExpire: 0,
+    boxes: { common: 0, rare: 0, epic: 0, legendary: 0 },
+    x2GamesLeft: 0, casinoBuff: false, boldChat: false, eloGuard: false, yellowCards: 0,
+    lastDaily: "", dailyStreak: 0,
+  };
+  e[auth].name = name;
+  return e[auth];
+}
+function vipActive(e) { return e.vipTier === 4 || (e.vipExpire && e.vipExpire > Now()); }
+function vipMult(e) { if (!vipActive(e)) return 1; return { 1: 1.2, 2: 1.5, 3: 2, 4: 3 }[e.vipTier] || 1; }
+function grantTitle(e, title) { if (!title) return; if (!e.titles.includes(title)) e.titles.push(title); e.title = title; }
+function teamAvgRating(team) {
+  const ids = teamIds(team); if (!ids.length) return 1000;
+  let sum = 0; for (const id of ids) { const p = rec(id); sum += stat(p.auth, p.name).rating; }
+  return sum / ids.length;
+}
+function winProb(a, b) { return 1 / (1 + Math.pow(10, (b - a) / 400)); }
+function betMultiplier(prob) { return Math.round(Math.min(ECO.BET_HOUSE_EDGE / Math.max(prob, 0.02), ECO.BET_MAX_MULT) * 10) / 10; }
+
+/* ── Shop xu / VIP shop / Ruby shop ── */
+const SHOP_ITEMS = {
+  101: { icon: "🟢", name: "Màu Xanh Lục Bảo", cost: 3000, type: "color", color: 0x2ECC71 },
+  102: { icon: "🔵", name: "Màu Xanh Dương VIP", cost: 5000, type: "color", color: 0x3498DB },
+  103: { icon: "🟣", name: "Màu Tím Huyền Bí", cost: 10000, type: "color", color: 0x9B59B6 },
+  104: { icon: "🟡", name: "Màu Hoàng Kim", cost: 25000, type: "color", color: 0xF1C40F },
+  105: { icon: "🟠", name: "Màu Cam Lửa", cost: 50000, type: "color", color: 0xE67E22 },
+  106: { icon: "🔴", name: "Màu Đỏ Quyền Lực", cost: 80000, type: "color", color: 0xE74C3C },
+  107: { icon: "🌸", name: "Màu Hồng Neon", cost: 120000, type: "color", color: 0xFF69B4 },
+  108: { icon: "🩵", name: "Màu Xanh Băng Tuyết", cost: 200000, type: "color", color: 0x00FFFF },
+  109: { icon: "🔥", name: "Màu Rồng Lửa Ultimate", cost: 350000, type: "color", color: 0xFF4500 },
+  110: { icon: "🌌", name: "Màu Vũ Trụ Thần Thoại", cost: 500000, type: "color", color: 0xDA70D6 },
+  201: { icon: "🌱", name: "Danh hiệu [🌱NEWBIE]", cost: 2000, type: "title", value: "🌱NEWBIE" },
+  202: { icon: "👟", name: "Danh hiệu [👟NEYMAR]", cost: 99999999999, type: "title", value: "👟NEYMAR" },
+  203: { icon: "⚡", name: "Danh hiệu [⚡ISHOWSPEED]", cost: 1000000, type: "title", value: "⚡ISHOWSPEED" },
+  204: { icon: "🎯", name: "Danh hiệu [🎯GOLDEN BOOT]", cost: 2500000, type: "title", value: "🎯GOLDEN BOOT" },
+  205: { icon: "🔥", name: "Danh hiệu [🔥SÁT THỦ VÒNG CẤM]", cost: 5000000, type: "title", value: "🔥SÁT THỦ VÒNG CẤM" },
+  206: { icon: "🛡️", name: "Danh hiệu [🛡️BUFFON]", cost: 8000000000, type: "title", value: "🛡️BUFFON" },
+  207: { icon: "🏅", name: "Danh hiệu [🏅Ballon d'Or]", cost: 1200000000, type: "title", value: "🏅Ballon d'Or🏅🏅🏅" },
+  208: { icon: "👑", name: "Danh hiệu [👑HUYỀN THOẠI]", cost: 25000000000, type: "title", value: "👑HUYỀN_THOẠI" },
+  209: { icon: "💎", name: "Danh hiệu [💎CR7]", cost: 99999999999, type: "title", value: "💎CR7" },
+  210: { icon: "🐐", name: "Danh hiệu [CHAN ĐÊ-GOAT]", cost: 99999999999, type: "title", value: "🐐CHAN ĐÊ-GOAT" },
+  211: { icon: "🆘", name: "Danh hiệu [🆘❌🆘SA TỊ]", cost: 99999999999, type: "title", value: "🆘❌🆘SA TỊ" },
+  301: { icon: "🟨", name: "Tẩy Sạch Thẻ Vàng Phạt", cost: 20000, type: "perk_clean_yellow" },
+  302: { icon: "🛡️", name: "Bảo Hộ ELO Không Trừ Điểm", cost: 50000, type: "perk_elo_guard" },
+  303: { icon: "⚡", name: "X2 Xu Thưởng Thắng Trận (3 trận)", cost: 100000, type: "perk_x2_elo" },
+  304: { icon: "✨", name: "Chat Chữ Đậm Bold Cao Cấp", cost: 150000, type: "perk_bold_chat" },
+  305: { icon: "💫", name: "Thần Bài Casino +10% Tỷ Lệ Thắng", cost: 250000, type: "perk_casino_buff" },
+  405: { icon: "🎁", name: "Rương Báu Thường x3", cost: 10000, type: "box_pack", count: 3, boxType: "common" },
+  406: { icon: "💜", name: "Rương Báu Sử Thuyết x1", cost: 50000, type: "box_pack", count: 1, boxType: "epic" },
+  407: { icon: "💛", name: "Rương Báu Huyền Thoại x1", cost: 200000, type: "box_pack", count: 1, boxType: "legendary" },
+};
+const VIP_SHOP_ITEMS = {
+  401: { icon: "🎫", name: "Thẻ VIP 1 NGÀY", cost: 300000, type: "vip", tier: 1, tag: "🎫VIP_NGÀY", durationMs: 86400000 },
+  402: { icon: "⭐", name: "Thẻ VIP 1 TUẦN", cost: 1000000, type: "vip", tier: 2, tag: "⭐VIP_TUẦN", durationMs: 7 * 86400000 },
+  403: { icon: "💎", name: "Thẻ VIP 1 THÁNG", cost: 5000000, type: "vip", tier: 3, tag: "💎VIP_THÁNG", durationMs: 30 * 86400000 },
+  404: { icon: "👑", name: "Vé VIP VĨNH VIỄN TỐI CAO", cost: 20000000, type: "vip", tier: 4, tag: "👑SUPER_VIP", durationMs: 0 },
+};
+const RUBY_ITEMS = {
+  1: { icon: "🔴", name: "Màu chat Ruby Đỏ Máu", cost: 10, type: "color", color: 0x8B0000 },
+  2: { icon: "💎", name: "Danh hiệu [RUBY LORD]", cost: 20, type: "title", value: "💎RUBY LORD" },
+  3: { icon: "🔄", name: "Reset ELO âm về 1000", cost: 15, type: "elo_reset" },
+};
+function buyShopItem(p, id) {
+  const item = SHOP_ITEMS[id]; if (!item) return tell(p.id, "❌ Không có vật phẩm ID đó. Gõ !shop.", C.err);
+  const e = econ(p.auth, p.name);
+  if (e.coins < item.cost) return tell(p.id, `❌ Cần ${item.cost.toLocaleString()} xu.`, C.err);
+  e.coins -= item.cost;
+  switch (item.type) {
+    case "color": e.chatColor = item.color; break;
+    case "title": grantTitle(e, item.value); break;
+    case "perk_clean_yellow": e.yellowCards = 0; break;
+    case "perk_elo_guard": e.eloGuard = true; break;
+    case "perk_x2_elo": e.x2GamesLeft += 3; break;
+    case "perk_bold_chat": e.boldChat = true; break;
+    case "perk_casino_buff": e.casinoBuff = true; break;
+    case "box_pack": e.boxes[item.boxType] = (e.boxes[item.boxType] || 0) + item.count; break;
+  }
+  Store.touch();
+  tell(p.id, `🎉 Mua thành công ${item.icon} ${item.name}!`, C.ok, "bold");
+}
+function buyVipItem(p, id) {
+  const item = VIP_SHOP_ITEMS[id]; if (!item) return tell(p.id, "❌ Không có gói VIP đó. Gõ !vipshop.", C.err);
+  const e = econ(p.auth, p.name);
+  if (e.coins < item.cost) return tell(p.id, `❌ Cần ${item.cost.toLocaleString()} xu.`, C.err);
+  e.coins -= item.cost; e.vipTier = item.tier;
+  e.vipExpire = item.durationMs > 0 ? Now() + item.durationMs : 0;
+  grantTitle(e, item.tag);
+  Store.touch();
+  say(`👑 ${p.name} vừa nâng cấp ${item.icon} ${item.name}!`, C.super, "bold", 1);
+}
+function buyRubyItem(p, id) {
+  const item = RUBY_ITEMS[id]; if (!item) return tell(p.id, "❌ Không có vật phẩm Ruby đó. Gõ !rubyshop.", C.err);
+  const e = econ(p.auth, p.name);
+  if (e.ruby < item.cost) return tell(p.id, `❌ Cần ${item.cost} 💎 ruby.`, C.err);
+  e.ruby -= item.cost;
+  switch (item.type) {
+    case "color": e.chatColor = item.color; break;
+    case "title": grantTitle(e, item.value); break;
+    case "elo_reset": { const s = stat(p.auth, p.name); if (s.rating < 1000) s.rating = 1000; break; }
+  }
+  Store.touch();
+  tell(p.id, `💎 Mua thành công ${item.icon} ${item.name} bằng Ruby!`, C.info, "bold");
+}
+
+/* ── Rương báu ── */
+const BOX_TABLE = {
+  common: [{ w: 60, type: "coins", min: 100, max: 400 }, { w: 30, type: "coins", min: 400, max: 900 }, { w: 10, type: "box", boxType: "rare", count: 1 }],
+  rare: [{ w: 50, type: "coins", min: 800, max: 2000 }, { w: 30, type: "box", boxType: "epic", count: 1 }, { w: 20, type: "ruby", amount: 1 }],
+  epic: [{ w: 50, type: "coins", min: 3000, max: 8000 }, { w: 30, type: "ruby", amount: 2 }, { w: 20, type: "box", boxType: "legendary", count: 1 }],
+  legendary: [{ w: 50, type: "coins", min: 15000, max: 40000 }, { w: 30, type: "ruby", amount: 5 }, { w: 20, type: "title", value: "👑HUYỀN THOẠI RƯƠNG" }],
+};
+function rollBox(type) {
+  const table = BOX_TABLE[type], tw = table.reduce((s, r) => s + r.w, 0);
+  let roll = Math.random() * tw;
+  for (const r of table) { if (roll < r.w) return r; roll -= r.w; }
+  return table[table.length - 1];
+}
+
+/* ── Giftcode ── */
+const CODE_POOL = [
+  { label: "1.000 xu", apply: e => e.coins += 1000 }, { label: "5.000 xu", apply: e => e.coins += 5000 },
+  { label: "20.000 xu", apply: e => e.coins += 20000 }, { label: "1 ruby", apply: e => e.ruby += 1 },
+  { label: "5 ruby", apply: e => e.ruby += 5 }, { label: "1x Rương Thường", apply: e => e.boxes.common++ },
+  { label: "1x Rương Sử Thi", apply: e => e.boxes.epic++ },
+];
+function adminCreateCode(name) {
+  const picks = [...CODE_POOL].sort(() => Math.random() - 0.5).slice(0, 2);
+  Store.data.codes[name] = { rewards: picks, usedBy: {} };
+  Store.save();
+  return Store.data.codes[name];
+}
+function redeemCode(p, name) {
+  if (!name) return tell(p.id, "💡 !nhapcode <mã>", C.warn);
+  const code = Store.data.codes[name];
+  if (!code) return tell(p.id, "❌ Code không tồn tại hoặc đã hết hạn.", C.err);
+  if (code.usedBy[p.auth]) return tell(p.id, "❌ Bạn đã nhập code này rồi.", C.err);
+  code.usedBy[p.auth] = true;
+  const e = econ(p.auth, p.name);
+  let msg = "🎁 Bạn nhận: ";
+  code.rewards.forEach(r => { r.apply(e); msg += r.label + ", "; });
+  tell(p.id, msg.slice(0, -2), C.super, "bold");
+  Store.touch(); Store.save();
+}
+
+/* ── Cược trận (chỉ khán giả, mở đến bàn thắng đầu tiên) ── */
+function resolveScorerBets(scorerAuth) {
+  for (const [auth, bet] of Object.entries(S.bets.scorer)) {
+    if (scorerAuth && bet.targetAuth === scorerAuth) {
+      const e = econ(auth, bet.bettorName);
+      const payout = Math.floor(bet.amount * ECO.BET_SCORER_MULT * vipMult(e));
+      e.coins += payout;
+      say(`💰 ${bet.bettorName} cược đúng ${bet.targetName} ghi bàn! +${payout.toLocaleString()} xu`, C.ok, "bold", 1);
+    }
+  }
+  S.bets.scorer = {};
+  Store.touch();
+}
+function resolveWinnerBets(winTeam) {
+  const winSide = winTeam === 1 ? "do" : "xanh";
+  const entries = Object.entries(S.bets.winner);
+  if (entries.length) {
+    for (const [auth, bet] of entries) {
+      const e = econ(auth, bet.bettorName);
+      if (bet.side === winSide) {
+        const payout = Math.floor(bet.amount * bet.mult * vipMult(e));
+        e.coins += payout;
+        say(`🎉 ${bet.bettorName} thắng kèo! +${payout.toLocaleString()} xu`, C.ok, "bold", 1);
+      } else say(`💸 ${bet.bettorName} thua kèo, mất ${bet.amount.toLocaleString()} xu.`, C.err, "small");
+    }
+    Store.touch();
+  }
+  S.bets.winner = {}; S.betsLocked = false;
+}
+
+/* ── 8 minigame ── */
+function gameTaiXiu(p, side, amount) {
+  side = (side || "").toLowerCase();
+  if (!["tai", "xiu"].includes(side) || !isPosInt(amount)) return tell(p.id, "💡 !tx <tai|xiu> <xu>", C.warn);
+  const e = econ(p.auth, p.name); if (e.coins < amount) return tell(p.id, "❌ Không đủ xu.", C.err);
+  e.coins -= amount;
+  const d = [1, 2, 3].map(() => 1 + Math.floor(Math.random() * 6)), sum = d[0] + d[1] + d[2];
+  const triple = d[0] === d[1] && d[1] === d[2], result = sum >= 11 ? "tai" : "xiu";
+  tell(p.id, `🎲 [TÀI XỈU] ${d.join("-")} = ${sum} ➔ ${triple ? "BÃO (nhà cái ăn)" : result.toUpperCase()}`, C.info, "bold");
+  if (!triple && side === result) { const pay = Math.floor(amount * 1.95 * (e.casinoBuff ? 1.05 : 1)); e.coins += pay; tell(p.id, `🎉 Thắng! +${pay.toLocaleString()} xu`, C.ok, "bold"); }
+  else tell(p.id, `💸 Thua, mất ${amount.toLocaleString()} xu.`, C.err);
+  Store.touch();
+}
+const BAUCUA_FACES = ["bau", "cua", "tom", "ca", "ga", "nai"];
+const BAUCUA_ICON = { bau: "🎃", cua: "🦀", tom: "🦐", ca: "🐟", ga: "🐔", nai: "🦌" };
+function gameBauCua(p, pick, amount) {
+  pick = (pick || "").toLowerCase();
+  if (!BAUCUA_FACES.includes(pick) || !isPosInt(amount)) return tell(p.id, "💡 !baucua <bau|cua|tom|ca|ga|nai> <xu>", C.warn);
+  const e = econ(p.auth, p.name); if (e.coins < amount) return tell(p.id, "❌ Không đủ xu.", C.err);
+  e.coins -= amount;
+  const rolls = [0, 0, 0].map(() => BAUCUA_FACES[Math.floor(Math.random() * 6)]);
+  const matches = rolls.filter(r => r === pick).length;
+  tell(p.id, `🎲 [BẦU CUA] ${rolls.map(r => BAUCUA_ICON[r]).join(" ")}`, C.info, "bold");
+  if (matches === 0) return tell(p.id, `💸 Không trúng, mất ${amount.toLocaleString()} xu.`, C.err);
+  const pay = amount * (matches + 1); e.coins += pay; Store.touch();
+  tell(p.id, `🎉 Trúng ${matches} ${BAUCUA_ICON[pick]}! Nhận ${pay.toLocaleString()} xu!`, C.ok, "bold");
+}
+function gameChanLe(p, pick, amount) {
+  pick = (pick || "").toLowerCase();
+  if (!["chan", "le"].includes(pick) || !isPosInt(amount)) return tell(p.id, "💡 !chanle <chan|le> <xu>", C.warn);
+  const e = econ(p.auth, p.name); if (e.coins < amount) return tell(p.id, "❌ Không đủ xu.", C.err);
+  e.coins -= amount;
+  const roll = 1 + Math.floor(Math.random() * 6), result = roll % 2 === 0 ? "chan" : "le";
+  tell(p.id, `🎲 [CHẴN LẺ] Ra mặt ${roll} ➔ ${result.toUpperCase()}`, C.info, "bold");
+  if (pick === result) { const pay = Math.floor(amount * 1.9); e.coins += pay; tell(p.id, `🎉 Thắng! +${pay.toLocaleString()} xu`, C.ok, "bold"); }
+  else tell(p.id, `💸 Thua, mất ${amount.toLocaleString()} xu.`, C.err);
+  Store.touch();
+}
+const WHEEL_TABLE = [{ w: 30, m: 0 }, { w: 25, m: 0.5 }, { w: 20, m: 1 }, { w: 12, m: 1.5 }, { w: 7, m: 2 }, { w: 4, m: 3 }, { w: 1.5, m: 5 }, { w: 0.5, m: 10 }];
+function gameVongQuay(p, amount) {
+  if (!isPosInt(amount)) return tell(p.id, "💡 !vongquay <xu>", C.warn);
+  const e = econ(p.auth, p.name); if (e.coins < amount) return tell(p.id, "❌ Không đủ xu.", C.err);
+  e.coins -= amount;
+  const tw = WHEEL_TABLE.reduce((s, x) => s + x.w, 0); let roll = Math.random() * tw, mult = 0;
+  for (const x of WHEEL_TABLE) { if (roll < x.w) { mult = x.m; break; } roll -= x.w; }
+  const pay = Math.floor(amount * mult);
+  tell(p.id, `🎡 [VÒNG QUAY] Ra x${mult}!`, C.info, "bold");
+  if (pay > 0) { e.coins += pay; tell(p.id, `🎉 Nhận ${pay.toLocaleString()} xu!`, C.ok, "bold"); }
+  else tell(p.id, `💸 Trắng tay, mất ${amount.toLocaleString()} xu.`, C.err);
+  Store.touch();
+}
+function gameOanTuTi(p, pick, amount) {
+  pick = (pick || "").toLowerCase();
+  const OPTS = ["bua", "keo", "bao"], ICON = { bua: "✊", keo: "✌️", bao: "✋" };
+  if (!OPTS.includes(pick) || !isPosInt(amount)) return tell(p.id, "💡 !oantudo <bua|keo|bao> <xu>", C.warn);
+  const e = econ(p.auth, p.name); if (e.coins < amount) return tell(p.id, "❌ Không đủ xu.", C.err);
+  e.coins -= amount;
+  const bot = OPTS[Math.floor(Math.random() * 3)];
+  tell(p.id, `${ICON[pick]} vs ${ICON[bot]} [OẲN TÙ TÌ] Bạn ra ${pick.toUpperCase()}, Bot ra ${bot.toUpperCase()}`, C.info, "bold");
+  if (pick === bot) { e.coins += amount; Store.touch(); return tell(p.id, "🤝 Hòa! Hoàn lại xu.", C.warn); }
+  const win = (pick === "bua" && bot === "keo") || (pick === "keo" && bot === "bao") || (pick === "bao" && bot === "bua");
+  if (win) { const pay = Math.floor(amount * 1.9); e.coins += pay; tell(p.id, `🎉 Thắng! +${pay.toLocaleString()} xu`, C.ok, "bold"); }
+  else tell(p.id, `💸 Thua, mất ${amount.toLocaleString()} xu.`, C.err);
+  Store.touch();
+}
+function gameDoiCuoc(p, amount) {
+  if (!isPosInt(amount)) return tell(p.id, "💡 !doicuoc <xu>", C.warn);
+  const e = econ(p.auth, p.name); if (e.coins < amount) return tell(p.id, "❌ Không đủ xu.", C.err);
+  e.coins -= amount;
+  const win = Math.random() < (0.5 + (e.casinoBuff ? 0.05 : 0));
+  tell(p.id, "🪙 [TUNG ĐỒNG XU] Cược gấp đôi...", C.info, "bold");
+  if (win) { const pay = amount * 2; e.coins += pay; tell(p.id, `🎉 NGỬA! +${pay.toLocaleString()} xu`, C.ok, "bold"); }
+  else tell(p.id, `💸 SẤP! Mất ${amount.toLocaleString()} xu.`, C.err);
+  Store.touch();
+}
+function draw3() { return [0, 0, 0].map(() => 1 + Math.floor(Math.random() * 13)).reduce((a, b) => a + b, 0); }
+function gameRut3La(p, amount) {
+  if (!isPosInt(amount)) return tell(p.id, "💡 !rut3la <xu>", C.warn);
+  const e = econ(p.auth, p.name); if (e.coins < amount) return tell(p.id, "❌ Không đủ xu.", C.err);
+  e.coins -= amount;
+  const my = draw3(), bot = draw3();
+  tell(p.id, `🃏 [RÚT 3 LÁ] Bạn: ${my} | Bot: ${bot}`, C.info, "bold");
+  if (my === bot) { e.coins += amount; Store.touch(); return tell(p.id, "🤝 Hòa! Hoàn lại xu.", C.warn); }
+  if (my > bot) { const pay = Math.floor(amount * 1.9); e.coins += pay; tell(p.id, `🎉 Thắng! +${pay.toLocaleString()} xu`, C.ok, "bold"); }
+  else tell(p.id, `💸 Thua, mất ${amount.toLocaleString()} xu.`, C.err);
+  Store.touch();
+}
+const SLOT_SYMBOLS = ["🍒", "🍋", "🍇", "🔔", "⭐", "💎"];
+function gameSlot(p, amount) {
+  if (!isPosInt(amount)) return tell(p.id, "💡 !slot <xu>", C.warn);
+  const e = econ(p.auth, p.name); if (e.coins < amount) return tell(p.id, "❌ Không đủ xu.", C.err);
+  e.coins -= amount;
+  const reels = [0, 0, 0].map(() => SLOT_SYMBOLS[Math.floor(Math.random() * SLOT_SYMBOLS.length)]);
+  tell(p.id, `🎰 [SLOT] ${reels.join(" | ")}`, C.info, "bold");
+  const uniq = new Set(reels).size, mult = uniq === 1 ? 10 : uniq === 2 ? 2 : 0;
+  if (mult > 0) { const pay = Math.floor(amount * mult); e.coins += pay; tell(p.id, `🎉 Trúng! +${pay.toLocaleString()} xu`, C.ok, "bold"); }
+  else tell(p.id, `💸 Không trúng, mất ${amount.toLocaleString()} xu.`, C.err);
+  Store.touch();
+}
+
+/* ═══════════════════ 11. HỆ THỐNG LỆNH ═══════════════════ */
+const CMDS = new Map(), CMD_LIST = [];
+function def(names, level, usage, desc, fn) {
+  const c = { names, level, usage, desc, fn };
+  CMD_LIST.push(c); names.forEach(n => CMDS.set(n, c));
+}
+function resolve(p, q, opt = {}) {
+  if (!q) { tell(p.id, "⚠ Thiếu người chơi. Dùng #id hoặc tên (dấu cách → _).", C.warn); return null; }
+  let hits = [];
+  if (q[0] === "#") { const t = S.players.get(parseInt(q.slice(1), 10)); if (t) hits = [t]; }
+  else {
+    const all = [...S.players.values()], k = plain(q);
+    hits = all.filter(t => plain(t.name) === k);
+    if (!hits.length) hits = all.filter(t => plain(t.name).startsWith(k));
+    if (!hits.length) hits = all.filter(t => plain(t.name).includes(k));
+  }
+  if (!hits.length) { tell(p.id, `❌ Không tìm thấy "${q}".`, C.err); return null; }
+  if (hits.length > 1) { tell(p.id, "⚠ Nhiều kết quả: " + hits.slice(0, 5).map(h => `#${h.id} ${h.name}`).join(", ") + " — dùng #id.", C.warn); return null; }
+  const t = hits[0];
+  if (t.id === p.id && !opt.self) { tell(p.id, "⚠ Không thể áp dụng lên chính bạn.", C.warn); return null; }
+  if (opt.outrank && t.id !== p.id && !(p.role > t.role)) {
+    tell(p.id, `⛔ Bạn không có quyền với ${ROLE_NAME[t.role]} ${t.name}.`, C.err);
+    audit(`${p.name} (${ROLE_NAME[p.role]}) bị chặn khi tác động lên ${t.name} (${ROLE_NAME[t.role]})`);
+    if (t.role === ROLE.SUPER) alertSupers(`${p.name} đã thử tác động lên Super Admin ${t.name}!`);
+    return null;
+  }
+  return t;
+}
+
+function runCommand(p, text) {
+  const t = Now();
+  if (t - p.lastCmd < CONFIG.CMD_COOLDOWN_MS) return tell(p.id, "⏳ Bạn gõ lệnh quá nhanh.", C.warn);
+  p.lastCmd = t;
+  const parts = text.slice(1).trim().split(/\s+/);
+  const name = (parts.shift() || "").toLowerCase();
+  const c = CMDS.get(name);
+  if (!c) return tell(p.id, `❓ Không có lệnh !${name}. Gõ !help.`, C.warn);
+  if (p.role < c.level) {
+    if (name !== "login") audit(`${p.name} thử dùng !${name} nhưng thiếu quyền`);
+    return tell(p.id, `⛔ Lệnh này yêu cầu ${ROLE_NAME[c.level]}.`, C.err);
+  }
+  try { c.fn(p, parts, text); } catch (e) { logErr("lệnh !" + name, e); tell(p.id, "⚠ Lỗi khi chạy lệnh.", C.err); }
+}
+
+/* ── LỆNH: MỌI NGƯỜI ── */
+def(["help", "h", "lenh"], 0, "!help [lệnh]", "Xem danh sách lệnh", (p, a) => {
+  if (a[0]) {
+    const c = CMDS.get(a[0].replace("!", "").toLowerCase());
+    if (!c || c.level > p.role) return tell(p.id, "❓ Không có lệnh đó.", C.warn);
+    return tell(p.id, `📖 ${c.usage} — ${c.desc} [${ROLE_NAME[c.level]}]`, C.info);
+  }
+  const names = lvl => CMD_LIST.filter(c => c.level === lvl && !c.hidden).map(c => "!" + c.names[0]).join(" ");
+  tellLines(p.id, "📜 LỆNH CƠ BẢN: " + names(0), C.info);
+  if (p.role >= 1) tellLines(p.id, "🛡 ADMIN: " + names(1), C.admin);
+  if (p.role >= 2) tellLines(p.id, "👑 SUPER: " + names(2), C.super);
+  tell(p.id, "💡 !help <lệnh> để xem chi tiết. Chat đội: bắt đầu bằng 't ' (vd: t đá vòng trái).", C.sys, "small");
+});
+
+def(["login", "dangnhap"], 0, "!login <mật khẩu>", "Đăng nhập quyền quản trị", (p, a) => {
+  const pw = a.join(" ");
+  const t = Now();
+  const f = S.loginFails.get(p.auth) || { n: 0, lockUntil: 0 };
+  if (f.lockUntil > t) return tell(p.id, `🔒 Bị khoá đăng nhập ${fmtDur(f.lockUntil - t)}.`, C.err);
+  if (pw && pw === CONFIG.PASSWORDS.SUPER) {
+    S.loginFails.delete(p.auth); setRole(p, ROLE.SUPER, true);
+    audit(`${p.name} đăng nhập SUPER`); say(`👑 ${p.name} đã đăng nhập Super Admin.`, C.super, "bold", 1);
+  } else if (pw && pw === CONFIG.PASSWORDS.ADMIN) {
+    S.loginFails.delete(p.auth); setRole(p, Math.max(p.role, ROLE.ADMIN), true);
+    audit(`${p.name} đăng nhập ADMIN`); say(`⚡ ${p.name} đã đăng nhập Admin.`, C.admin, "bold", 1);
+  } else {
+    f.n++;
+    if (f.n >= CONFIG.LOGIN_MAX_FAILS) f.lockUntil = t + CONFIG.LOGIN_LOCK_MS;
+    S.loginFails.set(p.auth, f);
+    audit(`${p.name} đăng nhập SAI (${f.n})`);
+    alertSupers(`${p.name} nhập sai mật khẩu quản trị (${f.n} lần).`);
+    tell(p.id, `❌ Sai mật khẩu (${f.n}/${CONFIG.LOGIN_MAX_FAILS}).`, C.err);
+    if (f.n >= CONFIG.LOGIN_BAN_FAILS) addBan(p, CONFIG.LOGIN_BAN_MIN, "Dò mật khẩu quản trị", "System");
+  }
+});
+CMDS.get("login").hidden = true;
+
+def(["logout", "dangxuat"], 0, "!logout", "Đăng xuất quyền quản trị (xoá ghi nhớ)", p => {
+  if (!p.role) return tell(p.id, "Bạn chưa đăng nhập.", C.warn);
+  setRole(p, ROLE.USER); tell(p.id, "🔓 Đã đăng xuất.", C.ok);
+});
+def(["afk"], 0, "!afk", "Tự chuyển sang AFK", p => { if (p.afk) return tell(p.id, "Bạn đã AFK rồi.", C.warn); moveAfk(p, "Bạn đã bật AFK"); });
+def(["back", "b"], 0, "!back", "Quay lại từ AFK", p => {
+  if (!p.afk) return tell(p.id, "Bạn không AFK.", C.warn);
+  p.afk = false; p.lastActive = Now(); syncQueue();
+  say(`✅ ${p.name} đã quay lại (hàng chờ #${S.queue.indexOf(p.id) + 1 || "-"}).`, C.ok, "small");
+  scheduleBalance();
+});
+def(["queue", "q", "hangcho"], 0, "!queue", "Xem hàng chờ & đội hình", p => {
+  syncQueue();
+  const nm = id => (rec(id) || {}).name;
+  const r = teamIds(1).map(nm).join(", ") || "-", b = teamIds(2).map(nm).join(", ") || "-";
+  tell(p.id, `⚽ [${MODE_INFO[S.mode].label}] 🔴 ${r}  vs  🔵 ${b}`, C.info);
+  tell(p.id, "⏳ Hàng chờ: " + (S.queue.map((id, i) => `${i + 1}.${nm(id)}`).join("  ") || "trống"), C.info);
+});
+def(["admins", "staff"], 0, "!admins", "Xem quản trị viên đang online", p => {
+  const s = [...S.players.values()].filter(x => x.role > 0).map(x => `${BADGE[x.role]}${x.name}`);
+  tell(p.id, "🛡 Quản trị online: " + (s.join(", ") || "không có"), C.info);
+});
+def(["stats", "me", "rank"], 0, "!stats [tên]", "Xem thống kê", (p, a) => {
+  let auth = p.auth, s;
+  if (a[0]) {
+    const q = plain(a.join("_"));
+    const online = [...S.players.values()].find(x => plain(x.name).includes(q));
+    if (online) auth = online.auth;
+    else { const hit = Object.entries(Store.data.stats).find(([, v]) => plain(v.name).includes(q)); if (!hit) return tell(p.id, "❌ Không có dữ liệu.", C.err); auth = hit[0]; }
+  }
+  s = Store.data.stats[auth];
+  if (!s) return tell(p.id, "📊 Chưa có dữ liệu trận đấu.", C.warn);
+  const wr = s.games ? Math.round(s.wins / s.games * 100) : 0, rk = rankOf(auth);
+  tell(p.id, `📊 ${s.name}: ${s.games} trận (${s.wins}T/${s.losses}B, ${wr}%) | ⚽${s.goals} 🅰${s.assists} 🤦${s.og} 🧤${s.cs} | ⭐${s.rating}${rk ? " | Hạng #" + rk : ""}`, C.info);
+});
+def(["top"], 0, "!top", "Bảng xếp hạng Elo", p => {
+  const all = Object.values(Store.data.stats).filter(v => v.games > 0).sort((a, b) => b.rating - a.rating).slice(0, 5);
+  if (!all.length) return tell(p.id, "🏆 Chưa có xếp hạng.", C.warn);
+  tell(p.id, "🏆 TOP: " + all.map((v, i) => `${i + 1}.${v.name}(${v.rating})`).join("  "), C.super);
+});
+def(["pm", "w"], 0, "!pm <tên|#id> <tin nhắn>", "Nhắn riêng", (p, a) => {
+  const t = resolve(p, a[0]); if (!t) return;
+  const msg = a.slice(1).join(" ");
+  if (!msg) return tell(p.id, "⚠ Thiếu nội dung.", C.warn);
+  const bad = filterChat(p, msg);
+  if (bad) return tell(p.id, "🚫 " + bad, C.err);
+  tell(t.id, `✉️ [PM] ${p.name}: ${msg}`, C.team, "normal", 1);
+  tell(p.id, `✉️ [PM → ${t.name}]: ${msg}`, C.team);
+});
+def(["reset", "practice"], 0, "!reset", "Đặt lại bóng về tâm (chỉ chế độ luyện tập)", p => {
+  if (S.mode !== "practice" || !running()) return tell(p.id, "⚠ Chỉ dùng được ở chế độ luyện tập.", C.warn);
+  room.setDiscProperties(0, { x: 0, y: 0, xspeed: 0, yspeed: 0 }); applyBallBuff();
+  tell(p.id, "🎯 Đã đặt lại bóng.", C.ok);
+});
+def(["bb", "bye"], 0, "!bb", "Rời phòng", p => room.kickPlayer(p.id, "Hẹn gặp lại 👋", false));
+def(["mode"], 0, "!mode [auto|1v1|2v2|practice]", "Xem/đổi chế độ (đổi: Admin)", (p, a) => {
+  if (!a[0]) return tell(p.id, `🎮 Chế độ: ${S.modeSetting === "auto" ? "AUTO → " : ""}${MODE_INFO[S.mode].label}`, C.info);
+  if (p.role < 1) return tell(p.id, "⛔ Chỉ Admin mới đổi được chế độ.", C.err);
+  const v = a[0].toLowerCase();
+  if (!["auto", "1v1", "2v2", "practice"].includes(v)) return tell(p.id, "⚠ Chọn: auto, 1v1, 2v2, practice.", C.warn);
+  S.modeSetting = v; audit(`${p.name} đặt chế độ ${v}`);
+  restartRound(`🎮 ${p.name} đổi chế độ: ${v.toUpperCase()}`);
+});
+
+/* ── LỆNH: KINH TẾ (XU / RUBY / SHOP / CƯỢC / MINIGAME) — mọi người ── */
+def(["vi", "wallet", "taikhoan"], 0, "!vi", "Xem ví: xu, ruby, VIP, danh hiệu", p => {
+  const e = econ(p.auth, p.name);
+  tell(p.id, `💰 ${e.coins.toLocaleString()} xu | 💎 ${e.ruby} ruby | Danh hiệu: ${e.title || "chưa có"}`, C.info, "bold");
+  tell(p.id, `👑 VIP: ${vipActive(e) ? (e.titles[e.titles.length - 1] || "VIP") : "Không có"}`, C.super);
+});
+def(["daily", "diemdanh"], 0, "!daily", "Điểm danh nhận xu mỗi ngày", p => {
+  const e = econ(p.auth, p.name);
+  const today = new Date().toDateString(), yesterday = new Date(Now() - 86400e3).toDateString();
+  if (e.lastDaily === today) return tell(p.id, "❌ Hôm nay điểm danh rồi!", C.err);
+  e.dailyStreak = e.lastDaily === yesterday ? e.dailyStreak + 1 : 1;
+  const reward = ECO.DAILY_BASE + Math.min((e.dailyStreak - 1) * ECO.DAILY_STREAK_BONUS, ECO.DAILY_STREAK_CAP - ECO.DAILY_BASE);
+  e.coins += reward; e.lastDaily = today; Store.touch();
+  tell(p.id, `🎁 Điểm danh +${reward.toLocaleString()} xu! Chuỗi ${e.dailyStreak} ngày.`, C.ok, "bold");
+});
+def(["give", "chuyenxu"], 0, "!give <tên|#id> <xu>", "Chuyển xu cho người khác", (p, a) => {
+  const t = resolve(p, a[0]); if (!t) return;
+  const amount = parseInt(a[1], 10);
+  if (!isPosInt(amount)) return tell(p.id, "💡 !give <tên|#id> <xu>", C.warn);
+  const e = econ(p.auth, p.name), te = econ(t.auth, t.name);
+  if (e.coins < amount) return tell(p.id, "❌ Không đủ xu.", C.err);
+  e.coins -= amount; te.coins += amount; Store.touch();
+  say(`💸 ${p.name} đã chuyển ${amount.toLocaleString()} xu cho ${t.name}!`, C.ok, "bold");
+});
+def(["shop"], 0, "!shop", "Xem shop xu", p => {
+  tellLines(p.id, "🛍️ SHOP: " + Object.entries(SHOP_ITEMS).map(([id, it]) => `#${id} ${it.icon}${it.name}(${it.cost.toLocaleString()}xu)`).join("  "), C.info);
+  tell(p.id, "👉 !buy <ID>", C.sys, "small");
+});
+def(["buy"], 0, "!buy <ID>", "Mua vật phẩm trong shop xu", (p, a) => buyShopItem(p, parseInt(a[0], 10)));
+def(["vipshop"], 0, "!vipshop", "Xem VIP shop", p => {
+  tellLines(p.id, "👑 VIP SHOP: " + Object.entries(VIP_SHOP_ITEMS).map(([id, it]) => `#${id} ${it.icon}${it.name}(${it.cost.toLocaleString()}xu)`).join("  "), C.super);
+  tell(p.id, "👉 !buyvip <ID>", C.sys, "small");
+});
+def(["buyvip"], 0, "!buyvip <ID>", "Mua gói VIP", (p, a) => buyVipItem(p, parseInt(a[0], 10)));
+def(["rubyshop"], 0, "!rubyshop", "Xem Ruby shop (mua bằng ruby)", p => {
+  tellLines(p.id, "💎 RUBY SHOP: " + Object.entries(RUBY_ITEMS).map(([id, it]) => `#${id} ${it.icon}${it.name}(${it.cost}💎)`).join("  "), C.info);
+  tell(p.id, "👉 !buyruby <ID>", C.sys, "small");
+});
+def(["buyruby"], 0, "!buyruby <ID>", "Mua vật phẩm Ruby shop", (p, a) => buyRubyItem(p, parseInt(a[0], 10)));
+def(["sellruby"], 0, "!sellruby <số>", "Bán Ruby lấy xu", (p, a) => {
+  const amt = parseInt(a[0], 10);
+  if (!isPosInt(amt, 1e6)) return tell(p.id, "💡 !sellruby <số>", C.warn);
+  const e = econ(p.auth, p.name);
+  if (e.ruby < amt) return tell(p.id, "❌ Không đủ ruby.", C.err);
+  const gain = Math.floor(amt * rubySellRate);
+  e.ruby -= amt; e.coins += gain; Store.touch();
+  tell(p.id, `💱 Bán ${amt} ruby được ${gain.toLocaleString()} xu (tỷ giá ${rubySellRate.toLocaleString()}/ruby).`, C.ok);
+});
+def(["doiruby"], 0, "!doiruby <số>", "Đổi xu lấy Ruby", (p, a) => {
+  const amt = parseInt(a[0], 10);
+  if (!isPosInt(amt, 1e6)) return tell(p.id, "💡 !doiruby <số>", C.warn);
+  const cost = Math.ceil(amt * ECO.RUBY_BUY_RATE);
+  const e = econ(p.auth, p.name);
+  if (e.coins < cost) return tell(p.id, `❌ Cần ${cost.toLocaleString()} xu.`, C.err);
+  e.coins -= cost; e.ruby += amt; Store.touch();
+  tell(p.id, `💱 Đổi ${cost.toLocaleString()} xu ➔ ${amt} ruby.`, C.ok, "bold");
+});
+def(["tygia"], 0, "!tygia", "Xem tỷ giá Ruby hiện tại", p => {
+  tell(p.id, `💱 Mua 1 ruby = ${ECO.RUBY_BUY_RATE.toLocaleString()} xu | Bán 1 ruby = ${rubySellRate.toLocaleString()} xu`, C.info);
+});
+def(["kho"], 0, "!kho", "Xem rương báu đang có", p => {
+  const e = econ(p.auth, p.name);
+  tell(p.id, `🎒 Rương: Thường ${e.boxes.common} | Hiếm ${e.boxes.rare} | Sử Thi ${e.boxes.epic} | Huyền Thoại ${e.boxes.legendary}`, C.super);
+  tell(p.id, "👉 !openbox <common|rare|epic|legendary> <số>", C.sys, "small");
+});
+def(["openbox"], 0, "!openbox <loại> <số>", "Mở rương báu", (p, a) => {
+  const type = (a[0] || "").toLowerCase(), qty = parseInt(a[1], 10) || 1;
+  if (!BOX_TABLE[type]) return tell(p.id, "💡 !openbox <common|rare|epic|legendary> <số>", C.warn);
+  const e = econ(p.auth, p.name);
+  if ((e.boxes[type] || 0) < qty || qty <= 0) return tell(p.id, `❌ Không đủ rương ${type}.`, C.err);
+  e.boxes[type] -= qty;
+  tell(p.id, `📦 Mở ${qty}x rương ${type.toUpperCase()}:`, C.super, "bold");
+  for (let i = 0; i < qty; i++) {
+    const r = rollBox(type);
+    if (r.type === "coins") { const amt = Math.floor(Math.random() * (r.max - r.min + 1)) + r.min; e.coins += amt; tell(p.id, `  ➔ 💰 +${amt.toLocaleString()} xu`, C.ok); }
+    else if (r.type === "ruby") { e.ruby += r.amount; tell(p.id, `  ➔ 💎 +${r.amount} ruby`, C.ok); }
+    else if (r.type === "box") { e.boxes[r.boxType] = (e.boxes[r.boxType] || 0) + r.count; tell(p.id, `  ➔ 🎁 +${r.count}x rương ${r.boxType}`, C.ok); }
+    else if (r.type === "title") { grantTitle(e, r.value); tell(p.id, `  ➔ 🏷️ Danh hiệu [${r.value}]`, C.ok); }
+  }
+  Store.touch();
+});
+def(["nhapcode"], 0, "!nhapcode <mã>", "Nhập giftcode", (p, a) => redeemCode(p, a[0]));
+def(["betwin", "cuoc"], 0, "!betwin <do|xanh> <xu>", "Cược đội thắng (chỉ khán giả, trước bàn thắng đầu)", (p, a) => {
+  if (S.mode === "practice") return tell(p.id, "⚠ Cược chỉ mở ở chế độ thi đấu (1v1/2v2).", C.warn);
+  if (!running()) return tell(p.id, "⚠ Chưa có trận đang diễn ra.", C.warn);
+  if (S.betsLocked) return tell(p.id, "⛔ Cược đã ĐÓNG (đã có bàn thắng).", C.err);
+  const pl = room.getPlayer(p.id);
+  if (!pl || pl.team !== 0) return tell(p.id, "⛔ Chỉ khán giả mới được cược (chống bán độ).", C.err);
+  const side = (a[0] || "").toLowerCase(), amount = parseInt(a[1], 10);
+  if (!["do", "xanh"].includes(side) || !isPosInt(amount)) return tell(p.id, "💡 !betwin <do|xanh> <xu>", C.warn);
+  if (S.bets.winner[p.auth]) return tell(p.id, "⛔ Bạn đã cược trận này rồi.", C.err);
+  const e = econ(p.auth, p.name);
+  if (e.coins < amount) return tell(p.id, "❌ Không đủ xu.", C.err);
+  const redProb = winProb(teamAvgRating(1), teamAvgRating(2));
+  const prob = side === "do" ? redProb : 1 - redProb;
+  const mult = betMultiplier(prob);
+  e.coins -= amount;
+  S.bets.winner[p.auth] = { side, amount, mult, bettorName: p.name };
+  Store.touch();
+  say(`🎯 ${p.name} cược ${amount.toLocaleString()} xu cho đội ${side === "do" ? "🔴ĐỎ" : "🔵XANH"} (x${mult})!`, C.info, "bold", 1);
+});
+def(["betscorer", "cuocghiban"], 0, "!betscorer <tên|#id> <xu>", "Cược người ghi bàn kế tiếp (chỉ khán giả)", (p, a) => {
+  if (S.mode === "practice") return tell(p.id, "⚠ Cược chỉ mở ở chế độ thi đấu.", C.warn);
+  if (!running()) return tell(p.id, "⚠ Chưa có trận đang diễn ra.", C.warn);
+  const pl = room.getPlayer(p.id);
+  if (!pl || pl.team !== 0) return tell(p.id, "⛔ Chỉ khán giả mới được cược.", C.err);
+  const t = resolve(p, a[0], { self: true }); if (!t) return;
+  const tpl = room.getPlayer(t.id);
+  if (!tpl || tpl.team === 0) return tell(p.id, "⛔ Người này không thi đấu.", C.err);
+  const amount = parseInt(a[1], 10);
+  if (!isPosInt(amount)) return tell(p.id, "💡 !betscorer <tên|#id> <xu>", C.warn);
+  if (S.bets.scorer[p.auth]) return tell(p.id, "⛔ Bạn đã cược ghi bàn rồi, chờ bàn tiếp theo.", C.err);
+  const e = econ(p.auth, p.name);
+  if (e.coins < amount) return tell(p.id, "❌ Không đủ xu.", C.err);
+  e.coins -= amount;
+  S.bets.scorer[p.auth] = { targetAuth: t.auth, targetName: t.name, amount, bettorName: p.name };
+  Store.touch();
+  say(`🎯 ${p.name} cược ${amount.toLocaleString()} xu rằng ${t.name} ghi bàn tiếp theo (x${ECO.BET_SCORER_MULT})!`, C.info, "bold", 1);
+});
+def(["keo", "tylekeo"], 0, "!keo", "Xem tỷ lệ kèo trận đang diễn ra", p => {
+  if (!running() || S.mode === "practice") return tell(p.id, "⚠ Không có trận đang cược.", C.warn);
+  const ra = teamAvgRating(1), rb = teamAvgRating(2), redProb = winProb(ra, rb);
+  tell(p.id, `📊 🔴ĐỎ ~${Math.round(ra)} elo (${(redProb * 100).toFixed(1)}%, x${betMultiplier(redProb)}) | 🔵XANH ~${Math.round(rb)} elo (${((1 - redProb) * 100).toFixed(1)}%, x${betMultiplier(1 - redProb)})`, C.info);
+});
+def(["tx", "taixiu"], 0, "!tx <tai|xiu> <xu>", "Minigame Tài Xỉu 3 xúc xắc (ăn x1.95)", (p, a) => gameTaiXiu(p, a[0], parseInt(a[1], 10)));
+def(["baucua"], 0, "!baucua <bau|cua|tom|ca|ga|nai> <xu>", "Minigame Bầu Cua Tôm Cá", (p, a) => gameBauCua(p, a[0], parseInt(a[1], 10)));
+def(["chanle"], 0, "!chanle <chan|le> <xu>", "Minigame Chẵn Lẻ (ăn x1.9)", (p, a) => gameChanLe(p, a[0], parseInt(a[1], 10)));
+def(["vongquay"], 0, "!vongquay <xu>", "Minigame Vòng Quay May Mắn (x0-x10)", (p, a) => gameVongQuay(p, parseInt(a[0], 10)));
+def(["oantudo"], 0, "!oantudo <bua|keo|bao> <xu>", "Minigame Oẳn Tù Tì với Bot (ăn x1.9)", (p, a) => gameOanTuTi(p, a[0], parseInt(a[1], 10)));
+def(["doicuoc"], 0, "!doicuoc <xu>", "Minigame Tung Đồng Xu gấp đôi/mất trắng", (p, a) => gameDoiCuoc(p, parseInt(a[0], 10)));
+def(["rut3la"], 0, "!rut3la <xu>", "Minigame Rút 3 Lá so điểm với Bot (ăn x1.9)", (p, a) => gameRut3La(p, parseInt(a[0], 10)));
+def(["slot"], 0, "!slot <xu>", "Minigame Máy Slot 3 ô (trùng 3 x10, trùng 2 x2)", (p, a) => gameSlot(p, parseInt(a[0], 10)));
+
+/* ── LỆNH: ADMIN ── */
+def(["list", "ds"], 1, "!list", "Danh sách người chơi + #id", p => {
+  tellLines(p.id, "👥 " + [...S.players.values()].map(x => `#${x.id} ${x.name}${x.role ? "(" + ROLE_NAME[x.role][0] + ")" : ""}${x.afk ? "💤" : ""}`).join(" | "), C.info);
+});
+def(["kick", "k"], 1, "!kick <tên|#id> [lý do]", "Đá người chơi", (p, a) => {
+  const t = resolve(p, a[0], { outrank: true }); if (!t || !guard(p)) return;
+  const reason = a.slice(1).join(" ") || "Vi phạm nội quy";
+  audit(`${p.name} KICK ${t.name}: ${reason}`);
+  say(`🥾 ${t.name} bị kick bởi ${p.name}: ${reason}`, C.warn);
+  room.kickPlayer(t.id, `Bị kick: ${reason}`, false);
+});
+def(["ban"], 1, "!ban <tên|#id> [phút|perm] [lý do]", "Ban (Admin ≤ 120p; perm chỉ Super)", (p, a) => {
+  const t = resolve(p, a[0], { outrank: true }); if (!t || !guard(p)) return;
+  let mins = parseInt(a[1], 10), ri = 2;
+  if (/^perm$/i.test(a[1] || "")) mins = 0;
+  else if (isNaN(mins)) { mins = 60; ri = 1; }
+  if (mins === 0 && p.role < ROLE.SUPER) return tell(p.id, "⛔ Chỉ Super Admin được ban vĩnh viễn.", C.err);
+  if (p.role < ROLE.SUPER) mins = clamp(mins, 1, CONFIG.ADMIN_MAX_BAN_MIN);
+  const reason = a.slice(ri).join(" ") || "Vi phạm nội quy";
+  audit(`${p.name} BAN ${t.name} ${mins || "perm"}p: ${reason}`);
+  say(`🔨 ${t.name} bị ban ${mins ? mins + " phút" : "vĩnh viễn"} bởi ${p.name}: ${reason}`, C.err);
+  addBan(t, mins, reason, p.name);
+});
+def(["mute", "m"], 1, "!mute <tên|#id> [phút=10] [lý do]", "Cấm chat", (p, a) => {
+  const t = resolve(p, a[0], { outrank: true }); if (!t || !guard(p)) return;
+  let mins = parseInt(a[1], 10), ri = 2;
+  if (isNaN(mins)) { mins = 10; ri = 1; }
+  mins = clamp(mins, 1, p.role >= 2 ? 1440 : CONFIG.ADMIN_MAX_MUTE_MIN);
+  const reason = a.slice(ri).join(" ") || "Vi phạm chat";
+  S.mutes.set(t.auth, { until: Now() + mins * 60e3, reason, by: p.name });
+  audit(`${p.name} MUTE ${t.name} ${mins}p`);
+  say(`🔇 ${t.name} bị mute ${mins} phút bởi ${p.name}.`, C.warn);
+});
+def(["unmute", "um"], 1, "!unmute <tên|#id>", "Gỡ mute", (p, a) => {
+  const t = resolve(p, a[0], { self: true }); if (!t) return;
+  if (S.mutes.delete(t.auth)) { say(`🔊 ${t.name} được gỡ mute bởi ${p.name}.`, C.ok); audit(`${p.name} UNMUTE ${t.name}`); }
+  else tell(p.id, "ℹ Người này không bị mute.", C.warn);
+});
+def(["move", "mv"], 1, "!move <tên|#id> <red|blue|spec>", "Chuyển đội", (p, a) => {
+  const t = resolve(p, a[0], { self: true }); if (!t) return;
+  const map = { red: 1, r: 1, blue: 2, b: 2, spec: 0, s: 0 }, team = map[(a[1] || "").toLowerCase()];
+  if (team === undefined) return tell(p.id, "⚠ Chọn red / blue / spec.", C.warn);
+  if (team) { t.afk = false; t.lastActive = Now(); room.setPlayerTeam(t.id, team); S.queue = S.queue.filter(x => x !== t.id); }
+  else toSpec(t.id);
+  syncQueue(); scheduleBalance(); audit(`${p.name} MOVE ${t.name} → ${a[1]}`);
+});
+def(["setafk"], 1, "!setafk <tên|#id>", "Ép một người sang AFK", (p, a) => {
+  const t = resolve(p, a[0], { outrank: true }); if (!t) return;
+  moveAfk(t, `${p.name} chuyển bạn sang AFK`);
+});
+def(["swap"], 1, "!swap", "Đổi màu 2 đội", p => {
+  const r = teamIds(1), b = teamIds(2);
+  r.forEach(id => room.setPlayerTeam(id, 2)); b.forEach(id => room.setPlayerTeam(id, 1));
+  say(`🔄 ${p.name} đã đổi phe 2 đội.`, C.info);
+});
+def(["rr", "restart"], 1, "!rr", "Chơi lại trận (giữ đội hình)", p => { audit(`${p.name} RR`); restartRound(`🔁 ${p.name} khởi động lại trận.`); });
+def(["start"], 1, "!start", "Bắt đầu / mở lại tự động", p => {
+  S.hold = false; if (!running()) { schedulePlan(300); say(`▶️ ${p.name} bắt đầu trận.`, C.ok); }
+});
+def(["stop"], 1, "!stop", "Dừng trận (tự mở lại sau 5 phút)", p => {
+  S.hold = true; S.holdUntil = Now() + CONFIG.HOLD_MAX_MS; S.result = null; S.winnerTeam = 0;
+  if (running()) room.stopGame(); say(`⏹ ${p.name} dừng trận.`, C.warn);
+});
+def(["pause"], 1, "!pause", "Tạm dừng / tiếp tục", p => {
+  if (!running()) return tell(p.id, "⚠ Chưa có trận.", C.warn);
+  room.pauseGame(!S.paused);
+});
+def(["buff"], 1, "!buff <tên|#id> <loại> [giây]", "Buff người chơi (không tính thống kê)", (p, a) => {
+  if (!a[0] || !a[1]) return tell(p.id, "🎁 Loại buff: " + Object.entries(BUFFS).filter(([, v]) => v.role <= p.role).map(([k, v]) => `${k}(${v.label})`).join(" "), C.info);
+  const t = resolve(p, a[0], { self: true }); if (!t) return;
+  const type = a[1].toLowerCase(), b = BUFFS[type];
+  if (!b) return tell(p.id, "❌ Không có buff đó. Gõ !buff để xem.", C.err);
+  if (b.role > p.role) return tell(p.id, "⛔ Buff này chỉ dành cho Super Admin.", C.err);
+  if (t.role >= p.role && t.id !== p.id && p.role < 2) return tell(p.id, "⛔ Không thể buff quản trị ngang/cao hơn.", C.err);
+  let sec = parseInt(a[2], 10); if (isNaN(sec)) sec = 60;
+  sec = p.role >= 2 ? clamp(sec, 0, CONFIG.SUPER_MAX_BUFF_SEC) : clamp(sec, 5, CONFIG.ADMIN_MAX_BUFF_SEC);
+  S.buffs.set(t.id, { type, until: sec ? Now() + sec * 1e3 : 0, by: p.name });
+  applyPlayerBuff(t.id); unrate("có buff");
+  audit(`${p.name} BUFF ${t.name} ${type} ${sec}s`);
+  say(`✨ ${t.name} nhận buff ${b.label}${sec ? " (" + sec + "s)" : ""} từ ${p.name}!`, C.super, "bold", 1);
+});
+def(["unbuff"], 1, "!unbuff <tên|#id|all>", "Gỡ buff", (p, a) => {
+  if ((a[0] || "").toLowerCase() === "all") { [...S.buffs.keys()].forEach(id => removePlayerBuff(id)); return say(`🧹 ${p.name} gỡ toàn bộ buff.`, C.info); }
+  const t = resolve(p, a[0], { self: true }); if (!t) return;
+  removePlayerBuff(t.id); say(`🧹 Gỡ buff của ${t.name}.`, C.info);
+});
+def(["clear", "cls"], 1, "!clear", "Xoá chat", p => { for (let i = 0; i < 25; i++) room.sendAnnouncement(" ", null, 0xFFFFFF, "small", 0); say(`🧽 ${p.name} đã xoá chat.`, C.sys); });
+def(["say", "announce"], 1, "!say <nội dung>", "Thông báo toàn phòng", (p, a) => { if (a.length) say("📢 " + a.join(" "), C.super, "bold", 2); });
+
+def(["buffcoin"], 1, "!buffcoin <tên|#id> <±xu>", "Cộng/trừ xu cho người chơi", (p, a) => {
+  const t = resolve(p, a[0], { self: true }); if (!t || !guard(p)) return;
+  const amt = parseInt(a[1], 10); if (isNaN(amt)) return tell(p.id, "💡 !buffcoin <tên|#id> <±xu>", C.warn);
+  const e = econ(t.auth, t.name); e.coins = Math.max(0, e.coins + amt); Store.touch();
+  audit(`${p.name} BUFFCOIN ${t.name} ${amt}`);
+  tell(t.id, `🏦 Bạn được ${p.name} ${amt >= 0 ? "cộng" : "trừ"} ${Math.abs(amt).toLocaleString()} xu! Số dư: ${e.coins.toLocaleString()}`, C.super, "bold", 1);
+  tell(p.id, `✅ Đã chỉnh xu của ${t.name}: ${amt >= 0 ? "+" : ""}${amt}`, C.ok);
+});
+def(["buffruby"], 1, "!buffruby <tên|#id> <±ruby>", "Cộng/trừ ruby cho người chơi", (p, a) => {
+  const t = resolve(p, a[0], { self: true }); if (!t || !guard(p)) return;
+  const amt = parseInt(a[1], 10); if (isNaN(amt)) return tell(p.id, "💡 !buffruby <tên|#id> <±ruby>", C.warn);
+  const e = econ(t.auth, t.name); e.ruby = Math.max(0, e.ruby + amt); Store.touch();
+  audit(`${p.name} BUFFRUBY ${t.name} ${amt}`);
+  tell(t.id, `💎 Bạn được ${p.name} ${amt >= 0 ? "cộng" : "trừ"} ${Math.abs(amt)} ruby!`, C.super, "bold", 1);
+  tell(p.id, `✅ Đã chỉnh ruby của ${t.name}: ${amt >= 0 ? "+" : ""}${amt}`, C.ok);
+});
+
+/* ── LỆNH: SUPER ADMIN ── */
+def(["setadmin"], 2, "!setadmin <tên|#id>", "Cấp quyền Admin (ghi nhớ theo auth)", (p, a) => {
+  const t = resolve(p, a[0]); if (!t) return;
+  if (t.role >= 1) return tell(p.id, "ℹ Người này đã là quản trị.", C.warn);
+  setRole(t, ROLE.ADMIN, true); audit(`${p.name} SETADMIN ${t.name}`);
+  say(`⚡ ${t.name} được ${p.name} cấp quyền Admin.`, C.admin, "bold", 1);
+});
+def(["removeadmin", "deladmin"], 2, "!removeadmin <tên|#id>", "Thu hồi quyền Admin", (p, a) => {
+  const t = resolve(p, a[0]); if (!t) return;
+  if (t.role === ROLE.SUPER) return tell(p.id, "⛔ Không thể hạ Super Admin.", C.err);
+  if (t.role === 0) return tell(p.id, "ℹ Người này không phải quản trị.", C.warn);
+  setRole(t, ROLE.USER); audit(`${p.name} REMOVEADMIN ${t.name}`);
+  say(`🔻 ${t.name} bị thu hồi quyền Admin.`, C.warn);
+});
+def(["banlist", "bans"], 2, "!banlist [trang]", "Danh sách ban", (p, a) => {
+  const bans = Store.data.bans, pg = Math.max(1, parseInt(a[0], 10) || 1), t = Now();
+  if (!bans.length) return tell(p.id, "📭 Không có ai bị ban.", C.info);
+  bans.slice((pg - 1) * 5, pg * 5).forEach((b, i) => tell(p.id,
+    `#${(pg - 1) * 5 + i + 1} ${b.name} — ${b.reason} — ${b.until ? "còn " + fmtDur(b.until - t) : "vĩnh viễn"} — bởi ${b.by}`, C.info));
+  tell(p.id, `Trang ${pg}/${Math.ceil(bans.length / 5)} — dùng !unban <số>`, C.sys, "small");
+});
+def(["unban"], 2, "!unban <số thứ tự|tên>", "Gỡ ban", (p, a) => {
+  const bans = Store.data.bans; let i = parseInt(a[0], 10) - 1;
+  if (isNaN(i)) i = bans.findIndex(b => plain(b.name).includes(plain(a.join("_"))));
+  if (i < 0 || i >= bans.length) return tell(p.id, "❌ Không tìm thấy mục ban.", C.err);
+  const [b] = bans.splice(i, 1); Store.save();
+  audit(`${p.name} UNBAN ${b.name}`); say(`✅ ${b.name} được gỡ ban bởi ${p.name}.`, C.ok);
+});
+def(["clearbans"], 2, "!clearbans", "Xoá toàn bộ ban", p => { Store.data.bans.length = 0; Store.save(); room.clearBans(); audit(`${p.name} CLEARBANS`); say("🧹 Đã xoá toàn bộ danh sách ban.", C.ok); });
+def(["ballbuff"], 2, "!ballbuff <fast|slow|big|small|heavy|light|bouncy|off>", "Buff quả bóng", (p, a) => {
+  const v = (a[0] || "").toLowerCase();
+  if (v === "off") { S.ballBuff = null; if (running()) room.setDiscProperties(0, sanitizeProps(ORIGINAL_BALL[S.mode] || BALL_ENGINE_DEFAULT)); return say("⚽ Bóng trở lại đúng kích thước gốc của map.", C.info); }
+  if (!BALL_BUFFS[v]) return tell(p.id, "⚠ Loại: " + Object.keys(BALL_BUFFS).join(", ") + ", off", C.warn);
+  S.ballBuff = v; applyBallBuff(); unrate("buff bóng"); say(`⚽ Bóng được buff: ${v} (bởi ${p.name})`, C.super, "bold", 1);
+});
+def(["scorelimit"], 2, "!scorelimit <số>", "Đặt giới hạn bàn thắng (áp dụng trận sau)", (p, a) => {
+  const n = clamp(parseInt(a[0], 10) || 0, 0, 20); S.limits.score = n; tell(p.id, `✅ Score limit = ${n} (từ trận sau).`, C.ok);
+});
+def(["timelimit"], 2, "!timelimit <phút>", "Đặt giới hạn thời gian (áp dụng trận sau)", (p, a) => {
+  const n = clamp(parseInt(a[0], 10) || 0, 0, 30); S.limits.time = n; tell(p.id, `✅ Time limit = ${n} phút (từ trận sau).`, C.ok);
+});
+def(["password", "pass"], 2, "!password <mật khẩu|off>", "Đặt/xoá mật khẩu phòng", (p, a) => {
+  if (!a[0] || a[0] === "off") { room.clearPassword(); return tell(p.id, "🔓 Đã bỏ mật khẩu phòng.", C.ok); }
+  room.setPassword(a.join(" ")); tell(p.id, "🔒 Đã đặt mật khẩu phòng.", C.ok);
+});
+def(["slow"], 2, "!slow <giây|0>", "Chế độ chat chậm", (p, a) => {
+  S.slowMs = clamp(parseInt(a[0], 10) || 0, 0, 60) * 1000;
+  say(S.slowMs ? `🐢 Chat chậm: ${S.slowMs / 1000}s/tin.` : "🐇 Tắt chat chậm.", C.info);
+});
+def(["chatlock", "lockchat"], 2, "!chatlock", "Khoá/mở chat (chỉ quản trị nói)", p => {
+  S.chatLocked = !S.chatLocked; say(S.chatLocked ? "🔒 Chat bị khoá — chỉ quản trị được nói." : "🔓 Đã mở chat.", C.info);
+});
+def(["resetstats"], 2, "!resetstats <tên|all confirm>", "Xoá thống kê", (p, a) => {
+  if (a[0] === "all") { if (a[1] !== "confirm") return tell(p.id, "⚠ Gõ: !resetstats all confirm", C.warn); Store.data.stats = {}; Store.save(); return say("🧹 Đã xoá toàn bộ thống kê.", C.warn); }
+  const t = resolve(p, a[0], { self: true }); if (!t) return;
+  delete Store.data.stats[t.auth]; Store.save(); tell(p.id, `✅ Đã xoá thống kê của ${t.name}.`, C.ok);
+});
+def(["log"], 2, "!log", "Xem nhật ký quản trị", p => S.audit.slice(-10).forEach(l => tell(p.id, l, C.sys, "small")));
+def(["setcoin"], 2, "!setcoin <tên|#id> <xu>", "Đặt số xu chính xác", (p, a) => {
+  const t = resolve(p, a[0], { self: true }); if (!t) return;
+  const v = parseInt(a[1], 10); if (isNaN(v) || v < 0) return tell(p.id, "💡 !setcoin <tên|#id> <xu>", C.warn);
+  econ(t.auth, t.name).coins = v; Store.touch();
+  audit(`${p.name} SETCOIN ${t.name} = ${v}`);
+  tell(p.id, `✅ Đặt xu ${t.name} = ${v.toLocaleString()}`, C.ok);
+});
+def(["setruby"], 2, "!setruby <tên|#id> <ruby>", "Đặt số ruby chính xác", (p, a) => {
+  const t = resolve(p, a[0], { self: true }); if (!t) return;
+  const v = parseInt(a[1], 10); if (isNaN(v) || v < 0) return tell(p.id, "💡 !setruby <tên|#id> <ruby>", C.warn);
+  econ(t.auth, t.name).ruby = v; Store.touch();
+  audit(`${p.name} SETRUBY ${t.name} = ${v}`);
+  tell(p.id, `✅ Đặt ruby ${t.name} = ${v}`, C.ok);
+});
+def(["taocode"], 2, "!taocode <tên>", "Tạo giftcode mới cho cả phòng", (p, a) => {
+  const name = a[0]; if (!name) return tell(p.id, "💡 !taocode <tên>", C.warn);
+  adminCreateCode(name);
+  audit(`${p.name} TAOCODE ${name}`);
+  say(`🎁 [GIFTCODE MỚI] "${name}" đang chờ! Gõ !nhapcode ${name} để nhận quà!`, C.super, "bold", 1);
+});
+def(["save"], 2, "!save", "Lưu dữ liệu ngay", p => { Store.save(); tell(p.id, "💾 Đã lưu.", C.ok); });
+
+/* ═══════════════════ 12. SỰ KIỆN PHÒNG ═══════════════════ */
+on("onRoomLink", url => console.log("[VN-HAX] Link phòng:", url));
+
+on("onPlayerJoin", pl => {
+  const t = Now();
+  const auth = pl.auth || ("c:" + pl.conn);
+  // 1. Ban?
+  const ban = findBan(pl.auth, pl.conn);
+  if (ban) return room.kickPlayer(pl.id, `Bạn bị ban: ${ban.reason} (${ban.until ? "còn " + fmtDur(ban.until - t) : "vĩnh viễn"})`, false);
+  // 2. Tên hợp lệ / trùng tên (chống mạo danh admin)
+  if (/^[\s\u200B-\u200F\u2028-\u202F\u2060-\u206F\uFEFF]*$/.test(pl.name)) return room.kickPlayer(pl.id, "Tên không hợp lệ.", false);
+  const dup = [...S.players.values()].some(x => plain(x.name) === plain(pl.name));
+  if (dup) return room.kickPlayer(pl.id, "Trùng tên với người đang online — hãy đổi tên.", false);
+  // 3. Giới hạn kết nối / IP
+  const sameIp = [...S.players.values()].filter(x => x.conn === pl.conn).length;
+  if (sameIp >= CONFIG.MAX_PER_IP) return room.kickPlayer(pl.id, "Quá số kết nối cho phép trên một mạng.", false);
+  // 4. Chống join flood
+  S.joinTimes = S.joinTimes.filter(x => t - x < CONFIG.JOIN_FLOOD_WINDOW_MS); S.joinTimes.push(t);
+  if (S.joinTimes.length >= CONFIG.JOIN_FLOOD_COUNT) {
+    try { room.setRequireRecaptcha(true); S.captchaUntil = t + 2 * 60e3; } catch (e) {}
+    return room.kickPlayer(pl.id, "Phòng đang bị flood, thử lại sau.", false);
+  }
+  // 5. Tạo hồ sơ
+  const p = { id: pl.id, name: pl.name, auth, realAuth: !!pl.auth, conn: pl.conn, role: 0, afk: false, afkSince: 0, afkWarned: false,
+    joinedAt: t, lastActive: t, lastChat: 0, lastCmd: 0, msgTimes: [], lastNorm: "", strikes: 0, lastStrike: 0, autoMutes: 0, acts: [] };
+  S.players.set(pl.id, p);
+  // 6. Tự đăng nhập lại theo auth đã lưu
+  const saved = pl.auth && Store.data.staff[pl.auth];
+  if (saved) { setRole(p, saved.role, false); say(`${saved.role === 2 ? "👑" : "⚡"} ${p.name} (${ROLE_NAME[saved.role]}) vào phòng.`, saved.role === 2 ? C.super : C.admin, "bold", 1); }
+  else say(`➕ ${p.name} vào phòng.`, C.sys, "small");
+  tell(p.id, `👋 Chào ${p.name}! Phòng 1v1 / 2v2 tự chia đội. Gõ !help để xem lệnh.`, C.ok);
+  syncQueue();
+  if (!running()) { if (!S.planTimer) schedulePlan(1000); } else scheduleBalance();
+});
+
+on("onPlayerLeave", pl => {
+  const p = rec(pl.id);
+  if (!p) return;
+  if (running() && pl.team !== 0 && S.match && S.match.rated && !p.afk && Now() - (S.match.t0 || 0) > 30e3) {
+    const s = stat(p.auth, p.name); s.leaves++; s.rating = Math.max(0, s.rating - 8); Store.touch();
+  }
+  S.players.delete(pl.id); S.buffs.delete(pl.id);
+  S.gone.set(pl.id, { rec: p, t: Now() });
+  S.queue = S.queue.filter(x => x !== pl.id);
+  say(`➖ ${p.name} rời phòng.`, C.sys, "small");
+  if (S.players.size === 0) { if (running()) room.stopGame(); S.queue = []; return; }
+  if (running()) scheduleBalance(); else if (!S.planTimer) schedulePlan(1000);
+});
+
+on("onPlayerChat", (pl, raw) => {
+  const p = rec(pl.id); if (!p) return false;
+  const msg = String(raw).trim(); if (!msg) return false;
+  p.lastActive = Now();
+  if (msg[0] === "!") { runCommand(p, msg); return false; }      // lệnh (kể cả !login) không hiện lên chat
+  const bad = filterChat(p, msg);
+  if (bad) { tell(p.id, "🚫 " + bad, C.err); return false; }
+  if (/^t\s/i.test(msg)) {                                         // chat đội
+    if (pl.team === 0) { tell(p.id, "ℹ Khán giả không có chat đội.", C.warn); return false; }
+    const text = msg.slice(2).trim();
+    list().filter(x => x.team === pl.team).forEach(x => tell(x.id, `[ĐỘI] ${p.name}: ${text}`, C.team, "normal", 1));
+    return false;
+  }
+  if (p.role >= 1) { say(`${BADGE[p.role]}${p.name}: ${msg}`, p.role === 2 ? C.super : C.admin, "normal", 1); return false; }
+  const e = econ(p.auth, p.name);
+  const titleTag = e.title ? `[${e.title}] ` : "";
+  say(`${titleTag}${p.name}: ${msg}`, e.chatColor || C.sys, e.boldChat ? "bold" : "normal", 1);
+  return false;
+}, false);
+
+on("onPlayerActivity", pl => { const p = rec(pl.id); if (p) { p.lastActive = Now(); p.afkWarned = false; } });
+
+on("onPlayerBallKick", pl => {
+  S.kickoffWaiting = false;
+  S.touches.push({ id: pl.id, team: pl.team, t: Now() });
+  if (S.touches.length > 5) S.touches.shift();
+  const p = rec(pl.id); if (p) p.lastActive = Now();
+});
+
+on("onPlayerTeamChange", (ch, by) => {
+  const p = rec(ch.id); if (!p) return;
+  if (ch.team !== 0) { p.afk = false; p.lastActive = Now(); }
+  syncQueue();
+  if (by) scheduleBalance();        // admin đổi đội thủ công qua giao diện
+});
+
+on("onPlayerAdminChange", (ch, by) => {
+  const p = rec(ch.id); if (!p) return;
+  const should = p.role >= 1;
+  if (ch.admin !== should) {         // ai đó bật/tắt admin gốc ngoài hệ thống → hoàn tác
+    room.setPlayerAdmin(ch.id, should);
+    if (by) { audit(`${by.name} thay đổi admin gốc của ${ch.name} → bị hoàn tác`); const a = rec(by.id); if (a && a.role < 2) tell(a.id, "⛔ Hãy dùng !setadmin (Super Admin).", C.err); }
+  }
+});
+
+// Chặn lạm dụng kick/ban qua giao diện gốc của HaxBall
+on("onPlayerKicked", (kicked, reason, ban, by) => {
+  if (!by) return;
+  const actor = rec(by.id);
+  const g = S.gone.get(kicked.id);
+  const victim = rec(kicked.id) || (g && g.rec);
+  if (!actor || !victim) return;
+  if (!(actor.role > victim.role)) {                       // đòi kick người ngang/cao quyền → phản đòn
+    if (ban) { try { room.clearBan(kicked.id); } catch (e) {} }
+    audit(`LẠM QUYỀN: ${actor.name} kick/ban ${victim.name} (${ROLE_NAME[victim.role]})`);
+    alertSupers(`${actor.name} đã kick/ban ${victim.name} trái quyền — đã hoàn tác.`);
+    if (actor.role < 2) { setRole(actor, ROLE.USER); say(`🛑 ${actor.name} bị tước quyền vì lạm dụng kick/ban.`, C.err); }
+    return;
+  }
+  if (actor.role === ROLE.ADMIN && !guard(actor)) { if (ban) { try { room.clearBan(kicked.id); } catch (e) {} } return; }
+  if (ban) {                                                // đổi ban gốc → ban do hệ thống quản lý
+    try { room.clearBan(kicked.id); } catch (e) {}
+    addBan(victim, actor.role >= 2 ? 0 : CONFIG.ADMIN_MAX_BAN_MIN, reason || "Ban qua giao diện", actor.name, false);
+  }
+  audit(`${actor.name} ${ban ? "BAN" : "KICK"} (UI) ${victim.name}: ${reason || ""}`);
+});
+
+on("onStadiumChange", (name, by) => {
+  if (!by) return;
+  S.mapKey = null;                                          // ai đó đổi map thủ công → khôi phục map của phòng
+  const a = rec(by.id); audit(`${a ? a.name : "?"} đổi map thủ công → khôi phục`);
+  say("🗺️ Bản đồ chỉ do hệ thống điều khiển — đang khôi phục.", C.warn);
+  restartRound();
+});
+
+on("onGameStart", () => {
+  S.match = { t0: Now(), rated: S.mode !== "practice", pl: {} };
+  S.touches = []; S.kickoffWaiting = true; S.kickoffTeam = 1;
+  S.paused = false;
+  S.bets = { winner: {}, scorer: {} }; S.betsLocked = false;
+  const t = Now(); for (const p of S.players.values()) { p.lastActive = t; p.afkWarned = false; }
+  if (S.buffs.size || S.ballBuff) unrate("có buff");
+  reapplyBuffs();
+  say(`🎮 Bắt đầu — ${MODE_INFO[S.mode].label}${S.mode === "practice" ? " (không tính thống kê)" : ""}!`, C.ok, "bold", 1);
+  if (S.mode !== "practice") say(`🎲 Cược mở! !betwin <do|xanh> <xu> hoặc !betscorer <tên> <xu> (khán giả, đến bàn thắng đầu tiên)`, C.info, "small");
+});
+
+on("onPositionsReset", () => {
+  S.kickoffWaiting = true; S.touches = [];
+  reapplyBuffs();
+});
+
+on("onTeamGoal", team => {
+  const t = Now(), last = S.touches[S.touches.length - 1];
+  S.kickoffWaiting = true; S.kickoffTeam = 3 - team;
+  const sc = room.getScores(), time = sc ? Math.floor(sc.time) : 0;
+  const mm = String(Math.floor(time / 60)).padStart(2, "0") + ":" + String(time % 60).padStart(2, "0");
+  if (last && t - last.t < 12e3 && rec(last.id)) {
+    const shooter = rec(last.id), own = last.team !== team;
+    const M = S.match, add = (p, k) => { if (!M) return; const x = M.pl[p.auth] || (M.pl[p.auth] = { name: p.name, g: 0, a: 0, og: 0 }); x[k]++; };
+    if (own) { add(shooter, "og"); say(`🤦 ${mm} — ${shooter.name} phản lưới nhà!`, C.warn, "bold", 1); }
+    else {
+      let assist = null;
+      for (let i = S.touches.length - 2; i >= 0; i--) {
+        const a = S.touches[i];
+        if (a.team === team && a.id !== last.id && last.t - a.t < 6e3 && rec(a.id)) { assist = rec(a.id); break; }
+        if (a.team !== team) break;
+      }
+      add(shooter, "g"); if (assist) add(assist, "a");
+      say(`⚽ ${mm} — ${shooter.name} ghi bàn!${assist ? " (kiến tạo: " + assist.name + ")" : ""}`, C.goal, "bold", 1);
+    }
+    if (S.mode !== "practice") { S.betsLocked = true; resolveScorerBets(own ? null : shooter.auth); }
+  } else {
+    say(`⚽ ${mm} — ${team === 1 ? "ĐỎ" : "XANH"} ghi bàn!`, C.goal, "bold", 1);
+    if (S.mode !== "practice") { S.betsLocked = true; resolveScorerBets(null); }
+  }
+  S.touches = [];
+});
+
+on("onTeamVictory", sc => {
+  if (S.mode === "practice") return;
+  const winner = sc.red > sc.blue ? 1 : 2;
+  S.result = { winner, red: sc.red, blue: sc.blue, time: sc.time };
+  say(`🏆 ${winner === 1 ? "ĐỎ" : "XANH"} chiến thắng ${sc.red} - ${sc.blue}!`, C.super, "bold", 2);
+  setTimeout(() => { try { if (running() && S.result) room.stopGame(); } catch (e) {} }, 3500);
+});
+
+on("onGameStop", () => {
+  S.paused = false;
+  commitMatch();
+  const res = S.result; S.result = null;
+  S.winnerTeam = res ? res.winner : 0;
+  clearBuffs();
+  S.touches = [];
+  schedulePlan(CONFIG.NEXT_MATCH_DELAY_MS);
+});
+
+on("onGamePause", () => { S.paused = true; S.pausedAt = Now(); });
+on("onGameUnpause", () => {
+  S.paused = false; const t = Now();
+  for (const p of S.players.values()) p.lastActive = t;
+});
+
+/* ═══════════════════ 13. VÒNG GIÁM SÁT (AFK / BÓNG / BIÊN / DỌN DẸP) ═══════════════════ */
+function tick() {
+  const t = Now();
+
+  // Dọn dẹp
+  for (const [id, g] of S.gone) if (t - g.t > 15e3) S.gone.delete(id);
+  if (S.captchaUntil && t > S.captchaUntil) { try { room.setRequireRecaptcha(false); } catch (e) {} S.captchaUntil = 0; }
+  if (t - S.lastSave > 30e3) { Store.flush(); S.lastSave = t; }
+
+  // Buff hết hạn
+  for (const [id, b] of [...S.buffs]) if (b.until && t > b.until) {
+    removePlayerBuff(id); const p = rec(id); if (p) say(`⌛ Buff của ${p.name} đã hết.`, C.sys, "small");
+  }
+
+  // AFK quá lâu → kick
+  if (CONFIG.AFK_FLAG_KICK_MS) for (const p of S.players.values())
+    if (p.afk && p.role === 0 && t - p.afkSince > CONFIG.AFK_FLAG_KICK_MS) room.kickPlayer(p.id, "AFK quá lâu.", false);
+
+  if (!running()) {   // watchdog: không để phòng đứng im
+    if (!S.planTimer && eligible().length > 0 && (!S.hold || t > S.holdUntil)) schedulePlan(1500);
+    return;
+  }
+  if (S.paused) {
+    if (t - S.pausedAt > CONFIG.PAUSE_MAX_MS) { room.pauseGame(false); say("▶️ Tự động tiếp tục trận (tạm dừng quá lâu).", C.info); }
+    return;
+  }
+
+  const geo = GEO[S.mode] || GEO["2v2"];
+
+  // ── AFK trong trận
+  for (const pl of list()) {
+    if (pl.team === 0) continue;
+    const p = rec(pl.id);
+    if (S.kickoffWaiting && S.mode !== "practice" && pl.team !== S.kickoffTeam) { p.lastActive = t; continue; }
+    const idle = t - p.lastActive;
+    if (idle >= CONFIG.AFK_MOVE_MS) moveAfk(p, "Bạn bị chuyển AFK vì không hoạt động");
+    else if (idle >= CONFIG.AFK_WARN_MS && !p.afkWarned) { p.afkWarned = true; tell(p.id, "⚠️ Bạn có vẻ đang AFK! Hãy di chuyển, nếu không sẽ bị chuyển sang khán đài.", C.warn, "bold", 2); }
+  }
+
+  // ── Bóng: chỉ chống văng ra ngoài biên / toạ độ lỗi (NaN). KHÔNG tự đưa bóng về giữa sân khi đứng yên.
+  const b = room.getDiscProperties(0);
+  if (b) {
+    if (!isFinite(b.x) || !isFinite(b.y) || !isFinite(b.xspeed) || !isFinite(b.yspeed)) {
+      // Toạ độ lỗi thật sự (NaN) — bắt buộc phải đặt lại vì không thể tính vị trí hợp lệ
+      room.setDiscProperties(0, { x: 0, y: 0, xspeed: 0, yspeed: 0 }); applyBallBuff();
+      audit("Bóng lỗi toạ độ (NaN) → đặt lại tâm");
+    } else if (Math.abs(b.x) > geo.outerW + 20 || Math.abs(b.y) > geo.outerH + 20) {
+      // Văng ra ngoài biên map do bug vật lý — kéo về sát biên gần nhất, KHÔNG đưa về tâm
+      room.setDiscProperties(0, {
+        x: clamp(b.x, -geo.outerW, geo.outerW),
+        y: clamp(b.y, -geo.outerH, geo.outerH),
+      });
+    } else if (S.kickoffWaiting && Math.hypot(b.xspeed, b.yspeed) > 0.3) {
+      S.kickoffWaiting = false;
+    }
+  }
+
+  // ── Người chơi: chống ra khỏi biên / toạ độ lỗi
+  for (const pl of list()) {
+    if (pl.team === 0) continue;
+    const d = room.getPlayerDiscProperties(pl.id);
+    if (d && (!isFinite(d.x) || !isFinite(d.y) || Math.abs(d.x) > geo.outerW + 10 || Math.abs(d.y) > geo.outerH + 10))
+      room.setPlayerDiscProperties(pl.id, { x: (pl.team === 1 ? -1 : 1) * geo.sx, y: 0, xspeed: 0, yspeed: 0 });
+  }
+}
+setInterval(() => { try { tick(); } catch (e) { logErr("tick", e); } }, 500);
+
+/* ═══════════════════ 14. KHỞI ĐỘNG ═══════════════════ */
+try {
+  room.setTeamColors(1, 60, 0xFFFFFF, [0xE84545]);
+  room.setTeamColors(2, 60, 0xFFFFFF, [0x4F8EF7]);
+  room.setTeamsLock(true);                 // người chơi không tự chuyển đội; hệ thống điều phối
+  room.setKickRateLimit(4, 0, 0);          // chống spam phím sút / macro
+  applyStadium("practice"); applyLimits("practice");
+} catch (e) { logErr("khởi động", e); }
+console.log("[VN-HAX] Phòng đã sẵn sàng. Bản đồ:", Object.keys(STADIUM_JSON).join(", "));
