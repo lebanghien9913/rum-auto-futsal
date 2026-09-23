@@ -36,7 +36,7 @@ const CONFIG = {
   ADMIN_MAX_MUTE_MIN: 60,
   ADMIN_MAX_BUFF_SEC: 300,
   SUPER_MAX_BUFF_SEC: 3600,
-  MAX_PER_IP: 2,                 // tối đa kết nối / IP
+  MAX_PER_IP: 1,                 // tối đa kết nối / IP ae chống bug vào rum bằng nhiều phòng ở đây nha
   JOIN_FLOOD_COUNT: 8,           // >= 8 lượt vào trong 10s = flood
   JOIN_FLOOD_WINDOW_MS: 10e3,
 
