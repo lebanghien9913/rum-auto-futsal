@@ -19,7 +19,7 @@ const CONFIG = {
   MAX_PLAYERS: 16,
   PUBLIC: true,
   ROOM_PASSWORD: null,
-  TOKEN: "thr1.AAAAAGqzNki3sXwAFr1ZRw.P00AL51c8EE",
+  TOKEN: "", // ae tự lấy toke nha
   GEO: { code: "VN", lat: 21.0285, lon: 105.8542 },
 
   PASSWORDS: { SUPER: "tuatlabo", ADMIN: "bomaylatuat" },   // để trống = tự sinh ngẫu nhiên
